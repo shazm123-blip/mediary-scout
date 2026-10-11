@@ -1,0 +1,63 @@
+name: mediary-scout-local
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mediary_local
+      POSTGRES_USER: mediary_local
+      POSTGRES_PASSWORD: mediary_local_dev
+    ports:
+      - "127.0.0.1:55469:5432"
+    volumes:
+      - local-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mediary_local -d mediary_local"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  pansou:
+    image: ghcr.io/fish2018/pansou-web:latest
+    env_file:
+      - deploy/pansou.channels.env
+    ports:
+      - "127.0.0.1:13081:80"
+    restart: unless-stopped
+
+  web:
+    image: mediary-scout-local:dev
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pansou:
+        condition: service_started
+    env_file:
+      - path: .env.local
+        required: false
+    environment:
+      MEDIA_TRACK_POSTGRES_URL: postgres://mediary_local:mediary_local_dev@postgres:5432/mediary_local
+      PANSOU_BASE_URL: http://pansou
+      MEDIA_TRACK_SEARCH_PROVIDER: tmdb
+      MEDIA_TRACK_WORKFLOW_ADAPTER: pansou
+      MEDIA_TRACK_STORAGE_ADAPTER: "115"
+      MEDIA_TRACK_AGENT_ADAPTER: vercel-ai
+      MEDIA_TRACK_DEMO_SEED: "0"
+      MEDIA_TRACK_FORK_BUILD: "1"
+    ports:
+      - "127.0.0.1:${LOCAL_WEB_PORT:-13080}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  local-pgdata:

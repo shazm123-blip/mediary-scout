@@ -37,6 +37,7 @@ export interface RealStorageV2Options {
   executor: StorageExecutor;
   registry: CandidateRegistry;
   workflowRunId: string;
+  allowIsoMovie?: boolean;
   /** When set, a transfer PROVEN dead (115 fail-loud / magnet-no-秒传) records the
    *  link so future PanSou searches filter it out before the agent sees it (#15). */
   deadLinkStore?: DeadLinkStore;
@@ -46,6 +47,7 @@ export class RealStorageV2 implements StorageV2 {
   private readonly executor: StorageExecutor;
   private readonly registry: CandidateRegistry;
   private readonly workflowRunId: string;
+  private readonly allowIsoMovie: boolean;
   private readonly deadLinkStore: DeadLinkStore | undefined;
   private readonly recordedAttempts: TransferAttempt[] = [];
 
@@ -53,6 +55,7 @@ export class RealStorageV2 implements StorageV2 {
     this.executor = options.executor;
     this.registry = options.registry;
     this.workflowRunId = options.workflowRunId;
+    this.allowIsoMovie = options.allowIsoMovie === true;
     this.deadLinkStore = options.deadLinkStore;
   }
 
@@ -280,7 +283,7 @@ export class RealStorageV2 implements StorageV2 {
       id: file.providerFileId,
       path: file.path,
       sizeBytes: file.sizeBytes,
-      isVideo: VIDEO_EXTENSIONS.test(file.path),
+      isVideo: VIDEO_EXTENSIONS.test(file.path) || (this.allowIsoMovie && /\.iso$/i.test(file.path)),
       isSubtitle: SUBTITLE_EXTENSIONS.test(file.path),
     }));
   }

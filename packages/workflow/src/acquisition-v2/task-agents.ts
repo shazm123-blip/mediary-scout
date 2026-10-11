@@ -326,6 +326,7 @@ ${tvLoopGuidance(options)}`;
 
 export function buildMovieSystemPrompt(options: TaskAgentPromptOptions): string {
   const loopEnds = movieLoopEnds(options);
+  const chosenIsoRun = options.qualityGuidance?.includes("用户已经选择这个唯一候选") === true;
   return `${SANDBOX_BOUNDARY}
 
 ${skillMandate("movie")}
@@ -333,7 +334,9 @@ ${memoryBlock(options)}${userRequestBlock(options)}${protectExistingLine(options
 You own the COMPLETE acquisition judgment for ONE movie: target正片 identification (guard against remakes/wrong films — cross-check BOTH title AND year), main-file selection, quality tradeoff, rejection of extras/trailers/foreign works, import cleanup, and marking. A movie is a SINGLE video file — there are no seasons or episodes; its one synthetic coverage token is "MOVIE".
 
 Identity (the hard part): the candidate must be THIS film, not a remake, sequel, prequel, or same-IP different film. Reject "蝙蝠侠：黑暗骑士崛起" when the target is "蝙蝠侠：黑暗骑士"; reject a 1990 version when the target is a later remake. When identity is unclear, do not transfer speculatively.
-Single video: reject packs, collections, multi-part, box sets, or anything structured like seasons/episodes. ALSO reject disc images — a 蓝光原盘 / ISO / BDMV full-disc dump (often 50–100GB+, isVideo=false) is NOT a usable film: you need ONE playable video file (mkv/mp4/ts). Prefer a 4K REMUX or 4K video over a 原盘/ISO even when the disc image is nominally higher quality; if the only candidate is a disc image, take a lower-quality VIDEO version instead. Among confirmed identity matches prefer the highest quality VIDEO stated transparently (4K REMUX/video > 1080p > 720p). Magnets and 115 shares both transfer directly — judge on identity/quality, never on link type.
+${chosenIsoRun
+  ? "Single film only: the user has already chosen the sole source. ISO is an allowed movie asset; BDMV folders are forbidden. Transfer only that source, verify its actual file, flatten ISO and subtitles, and never switch candidates on failure."
+  : "Single video: reject packs, collections, multi-part, box sets, or anything structured like seasons/episodes. ALSO reject disc images — a 蓝光原盘 / ISO / BDMV full-disc dump (often 50–100GB+, isVideo=false) is NOT a usable film: you need ONE playable video file (mkv/mp4/ts). Prefer a 4K REMUX or 4K video over a 原盘/ISO even when the disc image is nominally higher quality; if the only candidate is a disc image, take a lower-quality VIDEO version instead. Among confirmed identity matches prefer the highest quality VIDEO stated transparently (4K REMUX/video > 1080p > 720p). Magnets and 115 shares both transfer directly — judge on identity/quality, never on link type."} Magnets and 115 shares both transfer directly — judge on identity/quality, never on link type.
 
 Dead links are the norm — many shares are expired/cancelled (链接已过期 / 分享已取消 / 错误的链接). When you have RANKED several share candidates that are all the SAME target film (best resource first), hand that ORDERED list to transferUntilLanded({candidateIds:[...]}): it tries them in your order and stops at the first that 秒传-lands, abandoning the rest — so you don't spend a turn per dead link. It takes fail-loud SHARE links ONLY (115/夸克/天翼/123/光鸭 转存分享 — never magnets) and the SET must be your vetted choice (a keyword search mixes in same-named DIFFERENT works — e.g. a variety show or an unrelated cartoon — which you must exclude FIRST). For a magnet, or a single obvious share, use transferCandidate and verify via inspectStaging (a magnet does not fail loud — only the landing point tells you).
 

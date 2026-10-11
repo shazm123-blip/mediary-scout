@@ -83,6 +83,7 @@ import {
   titleBlockFilter,
   UNSCOPED_STORAGE,
   validateWorkflowRunSnapshot,
+  validMovieChoice,
   findStagingRecoveryIn,
   withDerivedEpisodeSummaries,
   workflowSnapshotFromReservation,
@@ -319,6 +320,58 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
 
   close(): void {
     this.db.close();
+  }
+
+  async publishMovieChoices(input: { workflowRunId: string; scope: WorkflowScope; resourceSnapshots: ResourceSnapshot[]; candidates: import("./movie-quality-policy.js").RankedMovieCandidate[] }): Promise<boolean> {
+    return this.db.transaction(() => {
+      const snapshot = this.loadSnapshot(input.workflowRunId);
+      if (!snapshot || snapshot.accountId !== input.scope.accountId || snapshot.connectedStorageId !== input.scope.connectedStorageId || !["movie_init", "replace_request"].includes(snapshot.workflowRun.kind) || snapshot.workflowRun.status !== "running") return false;
+      if (input.candidates.some((item) => !input.resourceSnapshots.some((resource) => resource.candidates.some((candidate) => candidate.id === item.id)))) return false;
+      snapshot.workflowRun.status = "awaiting_choice";
+      snapshot.workflowRun.movieChoices = { version: 1, candidates: input.candidates };
+      snapshot.resourceSnapshots = input.resourceSnapshots;
+      this.replaceWorkflowRunSnapshot(snapshot, { runOnly: true });
+      return true;
+    })();
+  }
+
+  async chooseMovieCandidate(input: { workflowRunId: string; candidateId: string; scope: WorkflowScope }): Promise<"chosen" | "already_chosen" | "unavailable"> {
+    return this.db.transaction(() => {
+      const snapshot = this.loadSnapshot(input.workflowRunId);
+      if (!snapshot || snapshot.accountId !== input.scope.accountId || snapshot.connectedStorageId !== input.scope.connectedStorageId) return "unavailable";
+      if (snapshot.workflowRun.status === "queued" && snapshot.workflowRun.movieChoices?.chosenId === input.candidateId) return "already_chosen";
+      if (snapshot.workflowRun.status !== "awaiting_choice" || !validMovieChoice(snapshot, input.candidateId)) return "unavailable";
+      snapshot.workflowRun.status = "queued";
+      snapshot.workflowRun.movieChoices = { ...snapshot.workflowRun.movieChoices!, chosenId: input.candidateId };
+      this.upsertWorkflowRun(snapshot.workflowRun);
+      return "chosen";
+    })();
+  }
+
+  async returnMovieChoiceToWaiting(input: { workflowRunId: string; scope: WorkflowScope; reason?: string }): Promise<boolean> {
+    return this.db.transaction(() => {
+      const snapshot = this.loadSnapshot(input.workflowRunId);
+      if (!snapshot || snapshot.accountId !== input.scope.accountId || snapshot.connectedStorageId !== input.scope.connectedStorageId || snapshot.workflowRun.status !== "running" || !snapshot.workflowRun.movieChoices?.chosenId) return false;
+      snapshot.workflowRun.status = "awaiting_choice";
+      snapshot.workflowRun.movieChoices = { version: 1, candidates: snapshot.workflowRun.movieChoices.candidates,
+        lastFailure: { candidateId: snapshot.workflowRun.movieChoices.chosenId!, reason: input.reason ?? "所选资源链接失效，请改选。" } };
+      snapshot.workflowRun.auditEvents.push({ type: "chosen_movie_source_failed", message: "Selected source failed; waiting for another user choice" });
+      this.upsertWorkflowRun(snapshot.workflowRun);
+      return true;
+    })();
+  }
+
+  async restartMovieChoiceSearch(input: { workflowRunId: string; scope: WorkflowScope }): Promise<boolean> {
+    return this.db.transaction(() => {
+      const snapshot = this.loadSnapshot(input.workflowRunId);
+      if (!snapshot || snapshot.accountId !== input.scope.accountId || snapshot.connectedStorageId !== input.scope.connectedStorageId ||
+          snapshot.workflowRun.status !== "awaiting_choice" || !snapshot.workflowRun.movieChoices) return false;
+      snapshot.workflowRun.status = "queued";
+      delete snapshot.workflowRun.movieChoices;
+      this.upsertWorkflowRun(snapshot.workflowRun);
+      this.db.prepare("DELETE FROM resource_snapshots WHERE workflow_run_id = ?").run(input.workflowRunId);
+      return true;
+    })();
   }
 
   async saveWorkflowRunSnapshot(
@@ -959,7 +1012,7 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
 
       // Only an init run owns its season's tracking; a cancelled replace_request is
       // just removed, and any messages it held go back to pending.
-      if (!tearsDownTrackingOnCancel(run.kind)) {
+      if (run.movieUpgrade || !tearsDownTrackingOnCancel(run.kind)) {
         if (run.kind === "replace_request") {
           // The user cancelled: nothing of this work stays urgent, or the idle scan would
           // queue it again within seconds. It waits for the patrol (or 现在处理).
@@ -1942,7 +1995,7 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     return this.db
       .prepare(
         "UPDATE user_messages SET status = 'pending', urgent = 0, run_id = NULL, updated_at = ? WHERE status = 'processing' AND NOT EXISTS (" +
-          "SELECT 1 FROM workflow_runs r WHERE r.id = user_messages.run_id AND (json_extract(r.payload, '$.status') IN ('queued', 'running') " +
+          "SELECT 1 FROM workflow_runs r WHERE r.id = user_messages.run_id AND (json_extract(r.payload, '$.status') IN ('queued', 'running', 'awaiting_choice') " +
           "OR json_extract(r.payload, '$.finishedAt') >= ?))",
       )
       .run(input.now, input.finishedBefore).changes;

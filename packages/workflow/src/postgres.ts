@@ -37,6 +37,7 @@ import {
   type ReserveWorkflowRunInput,
   type TrackedSeasonState,
   validateWorkflowRunSnapshot,
+  validMovieChoice,
   findStagingRecoveryIn,
   withDerivedEpisodeSummaries,
   workflowSnapshotFromReservation,
@@ -432,6 +433,62 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
   async close(): Promise<void> {
     await this.pool.end();
+  }
+
+  async publishMovieChoices(input: { workflowRunId: string; scope: WorkflowScope; resourceSnapshots: ResourceSnapshot[]; candidates: import("./movie-quality-policy.js").RankedMovieCandidate[] }): Promise<boolean> {
+    return this.withTransaction(async (client) => {
+      await client.query("SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE", [input.workflowRunId]);
+      const snapshot = await this.loadWorkflowRunSnapshot(client, input.workflowRunId);
+      if (!snapshot || snapshot.accountId !== input.scope.accountId || snapshot.connectedStorageId !== input.scope.connectedStorageId || !["movie_init", "replace_request"].includes(snapshot.workflowRun.kind) || snapshot.workflowRun.status !== "running") return false;
+      if (input.candidates.some((item) => !input.resourceSnapshots.some((resource) => resource.candidates.some((candidate) => candidate.id === item.id)))) return false;
+      snapshot.workflowRun.status = "awaiting_choice";
+      snapshot.workflowRun.movieChoices = { version: 1, candidates: input.candidates };
+      snapshot.resourceSnapshots = input.resourceSnapshots;
+      await this.replaceWorkflowRunSnapshot(client, snapshot, { runOnly: true });
+      return true;
+    });
+  }
+
+  async chooseMovieCandidate(input: { workflowRunId: string; candidateId: string; scope: WorkflowScope }): Promise<"chosen" | "already_chosen" | "unavailable"> {
+    return this.withTransaction(async (client) => {
+      await client.query("SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE", [input.workflowRunId]);
+      const snapshot = await this.loadWorkflowRunSnapshot(client, input.workflowRunId);
+      if (!snapshot || snapshot.accountId !== input.scope.accountId || snapshot.connectedStorageId !== input.scope.connectedStorageId) return "unavailable";
+      if (snapshot.workflowRun.status === "queued" && snapshot.workflowRun.movieChoices?.chosenId === input.candidateId) return "already_chosen";
+      if (snapshot.workflowRun.status !== "awaiting_choice" || !validMovieChoice(snapshot, input.candidateId)) return "unavailable";
+      snapshot.workflowRun.status = "queued";
+      snapshot.workflowRun.movieChoices = { ...snapshot.workflowRun.movieChoices!, chosenId: input.candidateId };
+      await this.upsertWorkflowRun(client, snapshot.workflowRun);
+      return "chosen";
+    });
+  }
+
+  async returnMovieChoiceToWaiting(input: { workflowRunId: string; scope: WorkflowScope; reason?: string }): Promise<boolean> {
+    return this.withTransaction(async (client) => {
+      await client.query("SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE", [input.workflowRunId]);
+      const snapshot = await this.loadWorkflowRunSnapshot(client, input.workflowRunId);
+      if (!snapshot || snapshot.accountId !== input.scope.accountId || snapshot.connectedStorageId !== input.scope.connectedStorageId || snapshot.workflowRun.status !== "running" || !snapshot.workflowRun.movieChoices?.chosenId) return false;
+      snapshot.workflowRun.status = "awaiting_choice";
+      snapshot.workflowRun.movieChoices = { version: 1, candidates: snapshot.workflowRun.movieChoices.candidates,
+        lastFailure: { candidateId: snapshot.workflowRun.movieChoices.chosenId!, reason: input.reason ?? "所选资源链接失效，请改选。" } };
+      snapshot.workflowRun.auditEvents.push({ type: "chosen_movie_source_failed", message: "Selected source failed; waiting for another user choice" });
+      await this.upsertWorkflowRun(client, snapshot.workflowRun);
+      return true;
+    });
+  }
+
+  async restartMovieChoiceSearch(input: { workflowRunId: string; scope: WorkflowScope }): Promise<boolean> {
+    return this.withTransaction(async (client) => {
+      await client.query("SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE", [input.workflowRunId]);
+      const snapshot = await this.loadWorkflowRunSnapshot(client, input.workflowRunId);
+      if (!snapshot || snapshot.accountId !== input.scope.accountId || snapshot.connectedStorageId !== input.scope.connectedStorageId ||
+          snapshot.workflowRun.status !== "awaiting_choice" || !snapshot.workflowRun.movieChoices) return false;
+      snapshot.workflowRun.status = "queued";
+      delete snapshot.workflowRun.movieChoices;
+      await this.upsertWorkflowRun(client, snapshot.workflowRun);
+      await client.query("DELETE FROM resource_snapshots WHERE workflow_run_id = $1", [input.workflowRunId]);
+      return true;
+    });
   }
 
   /** Create the schema once, memoized — lets the repo be constructed without
@@ -849,7 +906,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
 
       // Only an init run owns its season's tracking; a cancelled replace_request is
       // just removed, and any messages it held go back to pending.
-      if (!tearsDownTrackingOnCancel(run.kind)) {
+      if (run.movieUpgrade || !tearsDownTrackingOnCancel(run.kind)) {
         if (run.kind === "replace_request") {
           // The user cancelled: nothing of this work stays urgent, or the idle scan would
           // queue it again within seconds. It waits for the patrol (or 现在处理).
@@ -1770,7 +1827,7 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     // pending for the patrol (not urgent), like every other way a run ends unfinished.
     const result = await this.pool.query(
       "UPDATE user_messages SET status = 'pending', urgent = false, run_id = NULL, updated_at = $1 WHERE status = 'processing' AND NOT EXISTS (" +
-        "SELECT 1 FROM workflow_runs r WHERE r.id = user_messages.run_id AND (r.payload->>'status' IN ('queued', 'running') " +
+        "SELECT 1 FROM workflow_runs r WHERE r.id = user_messages.run_id AND (r.payload->>'status' IN ('queued', 'running', 'awaiting_choice') " +
         "OR r.payload->>'finishedAt' >= $2))",
       [input.now, input.finishedBefore],
     );

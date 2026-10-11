@@ -277,6 +277,7 @@ export async function queueMovieAcquisition(input: {
   createWorkflowRunId?: () => string;
   now?: () => string;
   staleActiveRunTimeoutMs?: number;
+  movieChoiceMode?: "blu-ray-iso";
 }): Promise<MovieAcquisitionRequestResult> {
   const now = input.now ?? (() => new Date().toISOString());
   const workflowRunId = input.createWorkflowRunId?.() ?? crypto.randomUUID();
@@ -297,6 +298,7 @@ export async function queueMovieAcquisition(input: {
       id: workflowRunId,
       kind: "movie_init",
       status: "queued",
+      ...(input.movieChoiceMode ? { movieChoiceMode: input.movieChoiceMode } : {}),
       trackedSeasonId: season.id,
       startedAt: queuedAt,
       finishedAt: null,
@@ -326,6 +328,36 @@ export async function queueMovieAcquisition(input: {
     return { status: "already_tracked", titleId: input.title.id, workflowRunId: null };
   }
   return { status: "queued", titleId: input.title.id, workflowRunId };
+}
+
+/** A tracked film can be searched again without changing its existing episode state. */
+export async function queueMovieUpgrade(input: {
+  state: import("./repository.js").TrackedSeasonState;
+  repository: WorkflowRepository;
+  createWorkflowRunId?: () => string;
+  now?: () => string;
+}): Promise<MovieAcquisitionRequestResult> {
+  if (input.state.title.type !== "movie") throw new Error("MOVIE_UPGRADE_REQUIRES_MOVIE");
+  const id = input.createWorkflowRunId?.() ?? crypto.randomUUID();
+  const startedAt = input.now?.() ?? new Date().toISOString();
+  const reservation = await input.repository.reserveWorkflowRun({
+    accountId: input.state.accountId,
+    connectedStorageId: input.state.connectedStorageId,
+    title: input.state.title,
+    season: input.state.season,
+    workflowRun: {
+      id, kind: "movie_init", status: "queued", trackedSeasonId: input.state.season.id,
+      startedAt, finishedAt: null, auditEvents: [{ type: "movie_upgrade_queued", message: "Manual movie quality search queued" }],
+      movieChoiceMode: "blu-ray-iso", movieUpgrade: {},
+    },
+    episodes: input.state.episodes,
+    resourceSnapshots: [], decisions: [], transferAttempts: [], notifications: [],
+    requireTrackedSeason: true, keepCurrentEpisodes: true, blockIfTitleHasActiveRun: true,
+  });
+  return reservation.status === "reserved"
+    ? { status: "queued", titleId: input.state.title.id, workflowRunId: id }
+    : { status: reservation.status === "already_active" ? "already_running" : "already_tracked",
+      titleId: input.state.title.id, workflowRunId: reservation.status === "already_active" ? reservation.snapshot.workflowRun.id : null };
 }
 
 export interface MovieReservationResult {

@@ -65,6 +65,51 @@ export class Pan115CookieClient implements Pan115StorageApi {
     this.userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
   }
 
+  /** Read-only share/snap walk used before a chosen movie is written. The web
+   * share API returns data.count/data.list with fc=1 file, fc=0 folder. */
+  async listShareFiles(input: { shareCode: string; receiveCode: string; directoryId: string }): Promise<Array<{ id: string; name: string; directory: boolean }>> {
+    const out: Array<{ id: string; name: string; directory: boolean }> = [];
+    let total: number | null = null;
+    const seen = new Set<string>();
+    for (let offset = 0; offset < 1000;) {
+      const query = new URLSearchParams({ share_code: input.shareCode, receive_code: input.receiveCode,
+        cid: input.directoryId, limit: String(this.listLimit), offset: String(offset), asc: "0", format: "json" });
+      const response = await this.fetchJson(`${PAN115_WEBAPI_BASE_URL}/share/snap?${query}`, {
+        method: "GET", headers: { ...this.headers(), Referer: buildShareReferer(input.shareCode, input.receiveCode) },
+      });
+      if (!responseState(response)) throwResponseFailure(response, "PAN115_SHARE_PREFLIGHT_FAILED");
+      const data = recordValue(response, "data");
+      const rawCount = recordValue(data, "count");
+      const rawList = recordValue(data, "list");
+      if ((typeof rawCount !== "number" && typeof rawCount !== "string") || !Array.isArray(rawList)) {
+        throw new Error("PAN115_SHARE_PREFLIGHT_INCOMPLETE");
+      }
+      const count = numberValue(rawCount);
+      if (!Number.isSafeInteger(count) || count < 0 || count > 1000 || (total !== null && count !== total)) {
+        throw new Error("PAN115_SHARE_PREFLIGHT_INCOMPLETE");
+      }
+      total = count;
+      for (const item of rawList) {
+        const fc = recordValue(item, "fc");
+        if (fc !== 0 && fc !== 1 && fc !== "0" && fc !== "1") throw new Error("PAN115_SHARE_PREFLIGHT_INCOMPLETE");
+        const directory = Number(fc) === 0;
+        const id = stringValue(recordValue(item, directory ? "cid" : "fid"));
+        const name = stringValue(recordValue(item, "n"));
+        if (!id || !name || seen.has(id)) throw new Error("PAN115_SHARE_PREFLIGHT_INCOMPLETE");
+        seen.add(id);
+        out.push({ id, name, directory });
+      }
+      if (out.length >= count) {
+        if (out.length !== count) throw new Error("PAN115_SHARE_PREFLIGHT_INCOMPLETE");
+        return out;
+      }
+      if (rawList.length === 0) throw new Error("PAN115_SHARE_PREFLIGHT_INCOMPLETE");
+      offset += rawList.length;
+      if (this.listPageDelayMs > 0) await sleep(this.listPageDelayMs);
+    }
+    throw new Error("PAN115_SHARE_PREFLIGHT_INCOMPLETE");
+  }
+
   async createFolder(input: { name: string; parentId: string }): Promise<string> {
     const response = await this.postForm(`${PAN115_WEBAPI_BASE_URL}/files/add`, [
       ["pid", input.parentId],

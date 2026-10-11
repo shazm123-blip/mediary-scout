@@ -412,6 +412,8 @@ export class TianyiClient {
     fileId: string;
     shareMode: string;
     accessCode: string;
+    pageNum?: number;
+    strict?: boolean;
   }): Promise<TianyiItem[]> {
     const d = await this.webGet("/api/open/share/listShareDir.action", [
       ["shareId", input.shareId],
@@ -421,10 +423,22 @@ export class TianyiClient {
       ["accessCode", input.accessCode],
       ["orderBy", "lastOpTime"],
       ["descending", "true"],
-      ["pageNum", "1"],
+      ["pageNum", String(input.pageNum ?? 1)],
       ["pageSize", "1000"],
       ["iconOption", "0"],
     ]);
+    if (input.strict) {
+      const listing = d["fileListAO"];
+      if (!listing || typeof listing !== "object" ||
+          !Array.isArray((listing as Record<string, unknown>)["folderList"]) ||
+          !Array.isArray((listing as Record<string, unknown>)["fileList"]))
+        throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+      const rows = [...((listing as Record<string, unknown>)["folderList"] as unknown[]),
+        ...((listing as Record<string, unknown>)["fileList"] as unknown[])];
+      if (rows.some((row) => !row || typeof row !== "object" || !strId((row as Record<string, unknown>)["id"]) ||
+          !String((row as Record<string, unknown>)["name"] ?? "")))
+        throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+    }
     return mergeTianyiListing(d["fileListAO"]);
   }
 

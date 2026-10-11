@@ -18,7 +18,7 @@ const USAGE = {
 } as const;
 
 /** Searches once, honestly reports no coverage. Drives the V2 sandbox loop. */
-function noCoverageModel() {
+function noCoverageModel(onPrompt?: (prompt: unknown) => void) {
   let i = 0;
   const tool = (name: string, input: unknown) => ({
     content: [{ type: "tool-call" as const, toolCallId: `c${i}`, toolName: name, input: JSON.stringify(input) }],
@@ -27,7 +27,8 @@ function noCoverageModel() {
     warnings: [],
   });
   return new MockLanguageModelV3({
-    doGenerate: async () => {
+    doGenerate: async (options) => {
+      onPrompt?.(options.prompt);
       i += 1;
       if (i === 1) return tool("searchResources", { keyword: "show" });
       if (i === 2) return tool("reportNoCoverage", { reason: "no candidates" });
@@ -78,6 +79,21 @@ describe("runQueuedType2Workflow (V2 engine)", () => {
     expect(seenAccountIds).toEqual(["acct_bob"]);
     const snapshot = await repository.getWorkflowRunSnapshot("run_bob_type2", "acct_bob");
     expect(snapshot?.accountId).toBe("acct_bob");
+  });
+
+  it.each(["tv", "anime"] as const)("keeps %s high/medium guidance while movie choice is enabled", async (type) => {
+    for (const qualityPreference of ["high", "medium"] as const) {
+      const repository = new InMemoryWorkflowRepository();
+      const fixture = trackedFixture();
+      await queueTrackingInitialization({ title: { ...fixture.title, type }, season: fixture.season,
+        keyword: "Show", repository, createWorkflowRunId: () => "quality_run", now: fixedNow });
+      const prompts: string[] = [];
+      await runQueuedType2Workflow({ repository, resourceProvider: emptyProvider(), storage: new FakeStorageExecutor(),
+        model: noCoverageModel((prompt) => prompts.push(JSON.stringify(prompt))), storageParentDirectoryId: "tv",
+        qualityPreference, movieQualityPreference: "blu-ray-iso", now: fixedNow });
+      expect(prompts.join("\n")).toContain(qualityPreference === "high" ? "画质偏好:高" : "画质偏好:中");
+      expect((await repository.getWorkflowRunSnapshot("quality_run"))?.workflowRun.status).toBe("no_coverage");
+    }
   });
 
   it("returns idle when no queued type2 run exists", async () => {

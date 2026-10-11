@@ -18,6 +18,27 @@ function paginatedFetch(totalCount: number, cid = "dir_big") {
 }
 
 describe("Pan115CookieClient", () => {
+  it("reads every share/snap page using returned page size and rejects duplicate pages", async () => {
+    const offsets: number[] = [];
+    const client = new Pan115CookieClient({ cookie: "cookie", listLimit: 3, listPageDelayMs: 0,
+      fetchJson: async (url) => {
+        const offset = Number(new URL(url).searchParams.get("offset"));
+        offsets.push(offset);
+        const files = [{ fid: "one", n: "Film.iso", fc: 1 }, { fid: "two", n: "Film.srt", fc: 1 }];
+        return { state: true, data: { count: 2, list: files.slice(offset, offset + 1) } };
+      },
+    });
+    expect(await client.listShareFiles({ shareCode: "abc", receiveCode: "", directoryId: "" }))
+      .toEqual([{ id: "one", name: "Film.iso", directory: false }, { id: "two", name: "Film.srt", directory: false }]);
+    expect(offsets).toEqual([0, 1]);
+
+    const duplicate = new Pan115CookieClient({ cookie: "cookie", listLimit: 1, listPageDelayMs: 0,
+      fetchJson: async () => ({ state: true, data: { count: 2, list: [{ fid: "one", n: "Film.iso", fc: 1 }] } }),
+    });
+    await expect(duplicate.listShareFiles({ shareCode: "abc", receiveCode: "", directoryId: "" }))
+      .rejects.toThrow("PAN115_SHARE_PREFLIGHT_INCOMPLETE");
+  });
+
   it("creates folders with the authenticated 115 web API", async () => {
     const requests: RecordedRequest[] = [];
     const client = new Pan115CookieClient({

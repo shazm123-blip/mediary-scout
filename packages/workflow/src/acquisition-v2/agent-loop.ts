@@ -14,6 +14,7 @@ import {
 } from "./agent-loop-guards.js";
 import { interpretTool, type AgentToolEvent } from "./activity.js";
 import { LINK_HISTORY_PROMPT } from "./link-history.js";
+import { isBrandStorageAuthError } from "../storage-auth-error.js";
 
 /**
  * Phase 3 — the agent loop harness. The strong agent drives its own
@@ -29,6 +30,7 @@ async function asEvidence(run: () => Promise<unknown>): Promise<unknown> {
   try {
     return await run();
   } catch (error) {
+    if (isBrandStorageAuthError(error)) throw error;
     return { error: error instanceof Error ? error.message : String(error) };
   }
 }

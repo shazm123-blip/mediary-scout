@@ -18,8 +18,12 @@ import {
 } from "./user-requests.js";
 import type { WorkflowStatus } from "./domain.js";
 import { runMovieAcquisitionV2AndPersist, runReplaceRequestV2AndPersist } from "./runner-v2.js";
+import { captureMovieStorageAuth, chosenMovieProvider, findMovieChoices, storageForChosenIso } from "./movie-choice-search.js";
+import { movieSharePreflightFailure, preflightChosenMovieSource } from "./movie-share-preflight.js";
+import { isBrandStorageAuthError } from "./storage-auth-error.js";
 import {
   handleWorkflowRunFailure,
+  isChosenMovieSourceError,
   requireCategoryParent,
   resolveWorkerDeps,
   storageParentForTitle,
@@ -341,7 +345,7 @@ export async function runQueuedReplaceRequest(
       repository,
       accountId: claimed.accountId,
       connectedStorageId: claimed.connectedStorageId,
-      ...optionalDeps(deps),
+      ...optionalDeps(deps, movie),
       workflowRun: { id: runId, startedAt: claimed.workflowRun.startedAt, finishedAt: null },
       userRequest,
       notice,
@@ -349,14 +353,71 @@ export async function runQueuedReplaceRequest(
     };
 
     if (movie) {
+      const chosenId = claimed.workflowRun.movieChoices?.chosenId;
+      if (!chosenId && (claimed.workflowRun.movieChoiceMode === "blu-ray-iso" || deps.movieQualityPreference === "blu-ray-iso")) {
+        const search = await findMovieChoices({
+          title: claimed.title, provider: deps.resourceProvider, model: deps.model, workflowRunId: runId,
+          ...(deps.jevJudge ? { jevJudge: deps.jevJudge } : {}),
+          ...(deps.preferredLanguage ? { preferredLanguage: deps.preferredLanguage } : {}),
+          ...(deps.agentMemory ? { memory: { store: repository, accountId: claimed.accountId,
+            ...(claimed.connectedStorageId ? { drive: claimed.connectedStorageId } : {}) } } : {}),
+          requestContext: userRequest.prompt.messages.map((message) => message.body),
+        });
+        await repository.saveWorkflowRunSnapshot({ ...claimed,
+          workflowRun: { ...claimed.workflowRun, movieChoiceMode: "blu-ray-iso" }, keepCurrentEpisodes: true });
+        const unsupportedIds = new Set(search.resourceSnapshots.flatMap((snapshot) => snapshot.candidates)
+          .filter((candidate) => candidate.type === "magnet" || candidate.type === "manual").map((candidate) => candidate.id));
+        const unsupportedOnly = search.candidates.length > 0 && search.candidates.every((candidate) => unsupportedIds.has(candidate.id));
+        if (search.candidates.length > 0 && !unsupportedOnly) {
+          const published = await repository.publishMovieChoices({
+            workflowRunId: runId, scope: { accountId: claimed.accountId, connectedStorageId: claimed.connectedStorageId },
+            resourceSnapshots: search.resourceSnapshots, candidates: search.candidates,
+          });
+          if (!published) throw new Error("MOVIE_CHOICES_PUBLISH_CONFLICT");
+          return { status: "ran", workflowRunId: runId, workflowStatus: "awaiting_choice" };
+        }
+        await repository.saveWorkflowRunSnapshot({ ...claimed,
+          workflowRun: { ...claimed.workflowRun, movieChoiceMode: "blu-ray-iso", status: "no_coverage", finishedAt: now() },
+          resourceSnapshots: search.resourceSnapshots,
+          notifications: [{ id: crypto.randomUUID(), workflowRunId: runId, kind: "no_coverage",
+            title: claimed.title.title, body: unsupportedOnly ? "找到的来源均不支持转存前只读核验，未转存；可稍后重新寻找。" : "未找到符合留言要求的电影候选，原文件已保留。", createdAt: now(), trigger: notice.trigger,
+            report: { titleName: claimed.title.title, seasonLabel: null, status: "no_coverage",
+              lines: ["未找到符合留言要求的电影候选，原文件已保留"], newlyObtained: [], realMissing: [],
+              tmdbId: claimed.title.tmdbId, mediaType: "movie" } }],
+          keepCurrentEpisodes: true });
+        await repository.releaseUserMessages({ runId, now: now(), urgent: false });
+        return { status: "ran", workflowRunId: runId, workflowStatus: "no_coverage" };
+      }
+      const guardedStorage = chosenId ? captureMovieStorageAuth(deps.storage) : null;
+      let chosenSourceIsIso = false;
+      if (chosenId) {
+        const chosen = claimed.resourceSnapshots.flatMap((snapshot) => snapshot.candidates)
+          .find((candidate) => candidate.id === chosenId);
+        if (!chosen) throw new Error("CHOSEN_MOVIE_CANDIDATE_MISSING");
+        const ranked = claimed.workflowRun.movieChoices?.candidates.find((candidate) => candidate.id === chosenId);
+        if (!ranked) throw new Error("CHOSEN_MOVIE_CANDIDATE_INVALID");
+        const preflight = await preflightChosenMovieSource({ storage: deps.storage, candidate: chosen,
+          expectIso: ranked.isoHint || ranked.tier === 1 || ranked.tier === 4 ? true : ranked.tier === null ? null : false });
+        chosenSourceIsIso = preflight.isIso;
+      }
       const result = await runMovieAcquisitionV2AndPersist({
         ...common,
         title: claimed.title,
         categoryParentId: requireCategoryParent(deps.moviesParentDirectoryId ?? input.moviesParentDirectoryId),
+        ...(chosenId ? {
+          movieChoiceSnapshot: claimed,
+          chosenSourceIsIso,
+          rejectBdmv: guardedStorage!.bdmvDetected,
+          resourceProvider: chosenMovieProvider(claimed.resourceSnapshots, chosenId),
+          storage: chosenSourceIsIso
+            ? storageForChosenIso(guardedStorage!.storage) : guardedStorage!.storage,
+        } : {}),
         // The film stays obtained only if it was: the old file is still there.
         priorObtained: filmObtained,
         holdLockOpen: true,
       });
+      if (guardedStorage?.authError()) throw guardedStorage.authError();
+      if (result.status === "awaiting_choice") return { status: "ran", workflowRunId: runId, workflowStatus: "awaiting_choice" };
       replacement = result.replacement;
       workflowStatus = result.status;
       finishLockRun = result.finishLockRun;
@@ -378,6 +439,17 @@ export async function runQueuedReplaceRequest(
       finishLockRun = result.finishLockRun;
     }
   } catch (error) {
+    const preflightReason = movieSharePreflightFailure(error);
+    if (claimed.workflowRun.movieChoices?.chosenId && preflightReason && !isBrandStorageAuthError(error)) {
+      const waiting = await repository.returnMovieChoiceToWaiting({ workflowRunId: runId,
+        scope: { accountId: claimed.accountId, connectedStorageId: claimed.connectedStorageId }, reason: preflightReason });
+      if (waiting) return { status: "ran", workflowRunId: runId, workflowStatus: "awaiting_choice" };
+    }
+    if (claimed.workflowRun.movieChoices?.chosenId && isChosenMovieSourceError(error)) {
+      const waiting = await repository.returnMovieChoiceToWaiting({ workflowRunId: runId,
+        scope: { accountId: claimed.accountId, connectedStorageId: claimed.connectedStorageId } });
+      if (waiting) return { status: "ran", workflowRunId: runId, workflowStatus: "awaiting_choice" };
+    }
     // The library stays as it was. The failure is recorded first: whether the run is
     // queued again decides who picks the messages up (see releaseAfterFailure).
     let requeued = false;
@@ -613,7 +685,7 @@ function messageFor(messages: UserMessage[], episode: string): UserMessage | und
 }
 
 /** The per-account options the runners take, present only when resolved. */
-function optionalDeps(deps: Awaited<ReturnType<typeof resolveWorkerDeps>>): {
+function optionalDeps(deps: Awaited<ReturnType<typeof resolveWorkerDeps>>, movie: boolean): {
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
   storageProvider?: string;
@@ -623,7 +695,7 @@ function optionalDeps(deps: Awaited<ReturnType<typeof resolveWorkerDeps>>): {
 } {
   return {
     ...(deps.preferredLanguage === undefined ? {} : { preferredLanguage: deps.preferredLanguage }),
-    ...(deps.qualityPreference === undefined ? {} : { qualityPreference: deps.qualityPreference }),
+    ...(movie || deps.qualityPreference === undefined ? {} : { qualityPreference: deps.qualityPreference }),
     ...(deps.storageProvider === undefined ? {} : { storageProvider: deps.storageProvider }),
     ...(deps.assrtToken === undefined ? {} : { assrtToken: deps.assrtToken }),
     ...(deps.jevJudge === undefined ? {} : { jevJudge: deps.jevJudge }),

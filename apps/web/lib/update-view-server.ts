@@ -3,6 +3,7 @@ import { fetchCommitRelation, fetchLatestDesktopRelease, fetchReleaseFeed } from
 import { buildUpdateView, desktopDownload, desktopFeed, desktopView, type UpdateView } from "./update-state";
 import { getUpdaterStatus, isUpdaterInstalled, servingRepoCommit } from "./updater-client";
 import { resolveIsDesktop } from "./workflow-runtime";
+import { isForkBuild } from "./fork-update-policy";
 
 /** Shared by the 「更新」 tab, 「立即更新」, the daily auto-update and the settings badge.
  *  The badge polls every 8 s per open tab, so it passes `{ updaterStatus: false }` to skip the updater call.
@@ -10,6 +11,19 @@ import { resolveIsDesktop } from "./workflow-runtime";
  *  running, or failed, is never offered. If the published release cannot be read, the
  *  changelog stays and nothing is offered. Desktop never talks to the updater. */
 export async function loadUpdateView(options: { updaterStatus?: boolean } = {}): Promise<UpdateView> {
+  if (isForkBuild()) {
+    const commit = await readBuildCommit();
+    return {
+      current: { label: `定制版本${commit ? ` · ${commit.slice(0, 8)}` : ""}`, tag: null },
+      available: null,
+      status: "unknown",
+      releases: [],
+      updater: null,
+      updaterInstalled: false,
+      download: null,
+      forkProtected: true,
+    };
+  }
   const desktop = resolveIsDesktop();
   const [buildCommit, releases, updater, published] = await Promise.all([
     readBuildCommit(),

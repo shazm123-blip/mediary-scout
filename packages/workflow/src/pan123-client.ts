@@ -316,8 +316,9 @@ export class Pan123Client {
   /** 列分享目录(share/get,登录态空码穿透)。分页游标 `next`(起始 "0"),读 data.InfoList
    *  + data.Next,停止哨兵同 listFiles。合并所有页——分享顶层 >100 文件时不静默截断
    *  (no-silent-caps,转存完整性)。 */
-  async listShareDir(input: { shareKey: string; sharePwd: string; parentFileId?: string }): Promise<Pan123Item[]> {
+  async listShareDir(input: { shareKey: string; sharePwd: string; parentFileId?: string; strict?: boolean }): Promise<Pan123Item[]> {
     const out: Pan123Item[] = [];
+    const seen = new Set<string>();
     let next = "0";
     for (let guard = 0; guard < 100; guard++) {
       const resp = await this.signed("/share/get", {
@@ -335,17 +336,23 @@ export class Pan123Client {
         },
       });
       const d = (resp["data"] ?? {}) as Record<string, unknown>;
+      if (input.strict && (!Array.isArray(d["InfoList"]) || !("Next" in d))) throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
       const infoList = Array.isArray(d["InfoList"]) ? (d["InfoList"] as unknown[]) : [];
       for (const it of infoList) {
-        out.push(mapPan123Item(it));
+        const item = mapPan123Item(it);
+        if (input.strict && (!item.id || !item.name || seen.has(item.id) ||
+            !it || typeof it !== "object" || ![0, 1, "0", "1"].includes((it as Record<string, unknown>)["Type"] as never)))
+          throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+        seen.add(item.id);
+        out.push(item);
       }
       const nextCursor = d["Next"];
       if (isStopCursor(nextCursor)) {
-        break;
+        return out;
       }
       next = String(nextCursor);
     }
-    return out;
+    throw new Error("PAN123_SHARE_LIST_INCOMPLETE");
   }
 
   // ── 转存链(share/get → file/copy/async) ─────────────────────────────────

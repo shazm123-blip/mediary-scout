@@ -110,6 +110,18 @@ function shanghai(iso: string): string {
 }
 
 describe("UpdateTab one-click update", () => {
+  it("protects a customized Docker version from upstream update controls", () => {
+    const html = render({
+      desktop: false,
+      view: view({ forkProtected: true, available: newer, status: "available", updater: updater({ phase: "idle" }), updaterInstalled: true }),
+    });
+    expect(html).toContain("当前为定制版本。官方更新需先合并并验证，再部署，保留你的获取规则。");
+    expect(html).not.toContain("检查更新");
+    expect(html).not.toContain(UPDATE_BUTTON);
+    expect(html).not.toContain("每天自动更新");
+    expect(html).not.toContain("./scripts/deploy.sh");
+  });
+
   it("shows progress while an update is active even when no newer release is offered", () => {
     const html = render({
       desktop: false,

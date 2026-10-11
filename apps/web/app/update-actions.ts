@@ -6,8 +6,10 @@ import { invalidateReleaseFeedCache } from "../lib/release-feed-server";
 import { resolveCurrentIsOwner } from "../lib/settings-attention-server";
 import { loadUpdateView } from "../lib/update-view-server";
 import { requestUpdate } from "../lib/updater-client";
+import { FORK_UPDATE_MESSAGE, isForkBuild } from "../lib/fork-update-policy";
 
 const REASON_TEXT = {
+  fork_protected: FORK_UPDATE_MESSAGE,
   no_updater: "一键更新需要先完成一次手动升级（见下方命令）。",
   busy: "已经在更新了。",
   needs_recovery: "上次更新回退没成功，请先在部署目录运行 ./scripts/deploy.sh 恢复，再更新。",
@@ -21,10 +23,11 @@ export async function startUpdateAction(
 ): Promise<{
   ok: boolean;
   message: string;
-  reason?: "no_updater" | "busy" | "needs_recovery" | "serving_unknown" | "bad_tag" | "unreachable" | "denied" | "stale";
+  reason?: "fork_protected" | "no_updater" | "busy" | "needs_recovery" | "serving_unknown" | "bad_tag" | "unreachable" | "denied" | "stale";
 }> {
   if (isDemoMode() || !(await resolveCurrentIsOwner()))
     return { ok: false, message: "没有权限。", reason: "denied" };
+  if (isForkBuild()) return { ok: false, message: FORK_UPDATE_MESSAGE, reason: "denied" };
   // Only the release the view itself offers — never an arbitrary string from the client,
   // and never an older tag (that would be a downgrade).
   const offered = (await loadUpdateView()).available?.tag;
@@ -45,6 +48,7 @@ export async function startUpdateAction(
 /** The 「每天自动更新」 switch and its hour, whole hours in Beijing time. */
 export async function saveAutoUpdateAction(enabled: boolean, time: string): Promise<{ ok: boolean; message: string }> {
   if (isDemoMode() || !(await resolveCurrentIsOwner())) return { ok: false, message: "没有权限。" };
+  if (enabled && isForkBuild()) return { ok: false, message: FORK_UPDATE_MESSAGE };
   if (!isAutoUpdateTime(time)) return { ok: false, message: "时间只能选整点。" };
   const { getWorkflowRepository, AUTO_UPDATE_ENABLED_SETTING_KEY, AUTO_UPDATE_TIME_SETTING_KEY } = await import(
     "../lib/workflow-runtime"

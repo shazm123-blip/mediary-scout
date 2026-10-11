@@ -285,7 +285,7 @@ export class GuangYaClient {
   async listShareFiles(
     accessToken: string,
     parentId: string,
-    options: { pageSize?: number; maxPages?: number } = {},
+    options: { pageSize?: number; maxPages?: number; strict?: boolean } = {},
   ): Promise<GuangYaItem[]> {
     const pageSize = options.pageSize ?? DEFAULT_LIST_PAGE_SIZE;
     // Pagination is by RESPONSE cursor echoed back (real-drive walk 2026-09-24: cursor
@@ -293,14 +293,33 @@ export class GuangYaClient {
     // hitting it FAILS LOUD — restoring a silently partial root would be a lie.
     const maxPages = options.maxPages ?? 50;
     const items: GuangYaItem[] = [];
+    const seen = new Set<string>();
     let cursor: number | undefined;
     for (let page = 0; page < maxPages; page += 1) {
       const body: Record<string, unknown> = { pageSize, accessToken, orderBy: 0, sortType: 0, parentId };
       if (cursor !== undefined) body.cursor = cursor;
       const data = await this.postAPI("/userres/v1/get_share_page_files_list", body);
-      const list = arrayValue(recordValue(data, "list")).filter(isRecord);
-      for (const raw of list) items.push(toItem(raw));
+      const rawList = recordValue(data, "list");
       const next = numberValue(recordValue(data, "cursor"));
+      if (options.strict && !Array.isArray(rawList)) {
+        if (cursor !== undefined && next === cursor && recordValue(data, "hasMore") !== true) return items;
+        throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+      }
+      if (options.strict && (rawList as unknown[]).some((row) => !isRecord(row)))
+        throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+      const list = arrayValue(recordValue(data, "list")).filter(isRecord);
+      for (const raw of list) {
+        const item = toItem(raw);
+        if (options.strict && (!item.fileId || !item.fileName || ![1, 2].includes(item.resType) || seen.has(item.fileId)))
+          throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+        seen.add(item.fileId);
+        items.push(item);
+      }
+      if (options.strict && list.length > 0 && recordValue(data, "hasMore") !== false &&
+          (!Number.isSafeInteger(next) || next <= 0 || next === cursor))
+        throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+      if (options.strict && list.length === 0 && recordValue(data, "hasMore") === true)
+        throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
       // The CURSOR drives pagination. Stop only on a definite end: an empty page, no /
       // repeated cursor, or an explicit hasMore:false. `total` is NOT trusted as a stop
       // — the real probes could not tell a directory total from a page count, and

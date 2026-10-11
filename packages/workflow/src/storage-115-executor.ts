@@ -8,6 +8,7 @@ import type {
 import { episodeCodeFromFileName } from "./episode-code.js";
 import { isPan115AuthError } from "./pan115-cookie-client.js";
 import type { StorageExecutor, UnparsedVideoFile } from "./ports.js";
+import { inspectShareTree } from "./movie-share-preflight.js";
 
 /**
  * Depth bound for the recursive video collectors, matching listTree's default.
@@ -127,6 +128,7 @@ export interface Pan115OfflineTask {
 }
 
 export interface Pan115StorageApi {
+  listShareFiles?(input: { shareCode: string; receiveCode: string; directoryId: string }): Promise<Array<{ id: string; name: string; directory: boolean }>>;
   createFolder(input: { name: string; parentId: string }): Promise<string>;
   listItems(input: { directoryId: string }): Promise<Pan115Item[]>;
   getDirectoryInfo(input: { directoryId: string }): Promise<Pan115DirectoryInfo | null>;
@@ -505,6 +507,16 @@ export class Storage115Executor implements StorageExecutor {
     this.subtitleMaterializeAttempts = options.subtitleMaterializeAttempts ?? 8;
     this.subtitleMaterializePollMs = options.subtitleMaterializePollMs ?? 6000;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  }
+
+  async inspectCandidateShare(candidate: ResourceCandidate): Promise<{ files: string[]; directories: string[] }> {
+    if (candidate.type !== "115") throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const url = stringValue(candidate.providerPayload["url"]);
+    const parsed = parseShareUrl(url);
+    if (!parsed || !this.api.listShareFiles) throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const receiveCode = stringValue(candidate.providerPayload["password"]) || parsed.receiveCode;
+    return inspectShareTree((directoryId) => this.callApi("listShareFiles", () => this.api.listShareFiles!({ shareCode: parsed.shareCode,
+      receiveCode, directoryId })), "");
   }
 
   /** Cumulative 115 API calls so far — surfaced into the agent trace AND used to

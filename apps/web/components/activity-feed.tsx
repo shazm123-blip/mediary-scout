@@ -54,6 +54,7 @@ export function ActivityFeed({ storageId }: { storageId?: string | undefined }) 
   }, [storageId]);
 
   const running = view.active.filter((run) => run.status === "running");
+  const awaitingChoice = view.active.filter((run) => run.status === "awaiting_choice");
   const queued = view.active
     .filter((run) => run.status === "queued")
     .sort((a, b) => (a.queuePosition ?? 0) - (b.queuePosition ?? 0));
@@ -70,6 +71,23 @@ export function ActivityFeed({ storageId }: { storageId?: string | undefined }) 
 
   return (
     <div className="activity">
+      <section className="act-section">
+        <div className="act-section-head act-section-head-static">等待选择版本</div>
+        {awaitingChoice.length === 0 ? (
+          <p className="act-empty">目前没有等待选择的电影。</p>
+        ) : (
+          awaitingChoice.map((run) => (
+            <Link key={run.runId} className="act-row act-row-queued" href={showHref(run.tmdbId, "library", storageId, run.type)}>
+              {poster(run.posterPath, run.title, "info")}
+              <span className="act-row-body act-row-inline">
+                <strong>{run.title}</strong>
+                <span className="act-pill">待选版本</span>
+                <span className="act-sub">查看候选并选择转存</span>
+              </span>
+            </Link>
+          ))
+        )}
+      </section>
       <section className="act-section">
         <div className="act-section-head act-section-head-static">获取中</div>
         {running.length === 0 && demoActive.length === 0 ? (

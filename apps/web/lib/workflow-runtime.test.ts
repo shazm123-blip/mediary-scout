@@ -17,6 +17,7 @@ import {
   resolveJevJudge,
   isJevPrefilterActive,
   getQualityPreference,
+  getMovieQualityPreference,
   movieTargetFromTmdbId,
   PANSOU_BASE_URL_SETTING_KEY,
   DEFAULT_PANSOU_BASE_URL,
@@ -322,6 +323,22 @@ describe("getQualityPreference", () => {
   it("garbage (incl. legacy '4K') → undefined (safe)", async () => {
     expect(await getQualityPreference(repoWith("4K"))).toBeUndefined();
     expect(await getQualityPreference(repoWith("ultra"))).toBeUndefined();
+    expect(await getQualityPreference(repoWith("blu-ray-iso"))).toBeUndefined();
+  });
+});
+
+describe("independent movie quality preference", () => {
+  it.each(["high", "medium"])("keeps %s for TV/anime with movie choice enabled", async (quality) => {
+    const settings = repoMap({ quality_preference: quality, movie_quality_preference: "blu-ray-iso" });
+    expect(await getQualityPreference(settings)).toBe(quality);
+    expect(await getMovieQualityPreference(settings)).toBe("blu-ray-iso");
+  });
+
+  it("reads the legacy mixed value only while the movie setting is absent", async () => {
+    expect(await getMovieQualityPreference(repoMap({ quality_preference: "blu-ray-iso" }))).toBe("blu-ray-iso");
+    expect(await getMovieQualityPreference(repoMap({ quality_preference: "blu-ray-iso", movie_quality_preference: "any" }))).toBeUndefined();
+    expect(await getMovieQualityPreference(repoMap({ quality_preference: "high" }))).toBeUndefined();
+    expect(await getMovieQualityPreference(repoMap({}))).toBeUndefined();
   });
 });
 

@@ -38,7 +38,7 @@ export interface ActivityActiveRun {
    *  spans many seasons even though `seasonNumber` is a single anchor value.
    *  [] for a replace_request run, which reads 「换源」 instead. */
   seasonNumbers: number[];
-  status: "queued" | "running";
+  status: "queued" | "running" | "awaiting_choice";
   /** 1-based position among queued items; null for the running one. */
   queuePosition: number | null;
   /** Aired-but-not-obtained episodes still needed. 0 for a replace_request run:
@@ -113,7 +113,7 @@ export async function getActivityView(input: {
     .map((snapshot) => snapshot.workflowRun.id);
 
   const active: ActivityActiveRun[] = activeRuns.map((snapshot) => {
-    const status = snapshot.workflowRun.status === "running" ? "running" : "queued";
+    const status = snapshot.workflowRun.status === "running" ? "running" : snapshot.workflowRun.status === "awaiting_choice" ? "awaiting_choice" : "queued";
     // A replace run covers the whole title; its snapshot is only the lock season's
     // (an S02E01 request would read 「第 1 季」 with S01's missing count).
     const titleLevel = snapshot.workflowRun.kind === "replace_request";

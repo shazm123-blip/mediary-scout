@@ -42,10 +42,42 @@ import {
 } from "./runner-v2.js";
 import { syncSeasonAgainstMetadata } from "./season-sync.js";
 import { isBrandStorageAuthError } from "./storage-auth-error.js";
+import { movieSharePreflightFailure, preflightChosenMovieSource } from "./movie-share-preflight.js";
 import { userMessageDrive, type UserMessageScope } from "./user-requests.js";
 // Circular with replace-request.ts (it uses this module's claim helpers); both sides
 // only call the other's functions at run time, never at module evaluation.
 import { queueReplaceRequest } from "./replace-request.js";
+import { captureMovieStorageAuth, chosenMovieProvider, findMovieChoices, storageForChosenIso } from "./movie-choice-search.js";
+import { classifyExistingMovieAsset, compareMovieUpgrade } from "./movie-quality-policy.js";
+import { legacyMediaLibraryFolderName, mediaLibraryFolderName } from "./media-library-folder.js";
+
+async function readMovieUpgradeAssets(storage: StorageExecutor, parentId: string, title: MediaTitle, verifiedIds: readonly string[]) {
+  const children = await storage.listChildDirectories(parentId);
+  const names = [mediaLibraryFolderName(title), legacyMediaLibraryFolderName(title)];
+  const directoryId = children.find((child) => child.name === names[0])?.id ??
+    children.find((child) => child.name === names[1])?.id;
+  if (!directoryId) return { currentAssets: [], oldFiles: [] as Array<{ id: string; path: string }> };
+  const tree = await storage.listTree({ directoryId });
+  const trustedIds = new Set(verifiedIds);
+  const main = tree.filter((file) => trustedIds.has(file.providerFileId) && !file.path.includes("/") &&
+    /\.(iso|mkv|mp4|avi|ts|m2ts|mov|flv|wmv)$/i.test(file.path));
+  return {
+    directoryId,
+    currentAssets: main.map((file) => classifyExistingMovieAsset(file.path, file.sizeBytes)),
+    oldFiles: tree.filter((file) => !file.path.includes("/") &&
+      (main.some((movie) => movie.providerFileId === file.providerFileId) ||
+       /\.(srt|ass|ssa|sub|vtt)$/i.test(file.path) && main.some((movie) => {
+         const stem = movie.path.replace(/\.[^.]+$/, "").toLowerCase();
+         const subtitle = file.path.toLowerCase();
+         const subtitleStem = subtitle.replace(/\.[^.]+$/, "");
+         if (subtitleStem === stem) return true;
+         if (!subtitleStem.startsWith(`${stem}.`)) return false;
+         const suffix = subtitleStem.slice(stem.length + 1);
+         return /^(?:zh|zh-cn|zh-tw|chs|cht|cn|en|eng|english|chinese|forced|sdh)(?:\.(?:zh|zh-cn|zh-tw|chs|cht|cn|en|eng|english|chinese|forced|sdh))*$/.test(suffix);
+       })))
+      .map((file) => ({ id: file.providerFileId, path: file.path })),
+  };
+}
 
 async function maybeFreezeOnBrandAuthError(input: {
   connectedStorageId: string | null | undefined;
@@ -103,6 +135,7 @@ export async function resolveWorkerDeps(
   llmConfig: { baseURL?: string; modelId?: string } | undefined;
   preferredLanguage: string | undefined;
   qualityPreference: "high" | "medium" | undefined;
+  movieQualityPreference: "blu-ray-iso" | undefined;
   storageProvider: string | undefined;
   assrtToken: string | undefined;
   jevJudge: JevJudge | undefined;
@@ -122,7 +155,8 @@ export async function resolveWorkerDeps(
     // falls back to the AGNOSTIC copy (never guess a config it cannot see).
     llmConfig: ctx.model !== undefined ? ctx.llmConfig : base.llmConfig,
     preferredLanguage: ctx.preferredLanguage ?? base.preferredLanguage,
-    qualityPreference: ctx.qualityPreference ?? base.qualityPreference,
+    qualityPreference: resolve ? ctx.qualityPreference : base.qualityPreference,
+    movieQualityPreference: resolve ? ctx.movieQualityPreference : base.movieQualityPreference,
     storageProvider: ctx.storageProvider ?? base.storageProvider,
     assrtToken: ctx.assrtToken ?? base.assrtToken,
     // Jev is per-account opt-in: with a resolver, its answer is authoritative even
@@ -174,6 +208,7 @@ export interface AccountWorkerContext {
   llmConfig?: { baseURL?: string; modelId?: string };
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  movieQualityPreference?: "blu-ray-iso";
   /** The run's drive brand ("pan115" | "quark") — selects brand-specific skill. */
   storageProvider?: string;
   /** assrt token (Settings → 字幕来源). Undefined = 字幕流程不触发。 */
@@ -398,7 +433,7 @@ export async function handleWorkflowRunFailure(input: {
   // episode bucket. The claimed copy is from queue time on InMemory, and a user
   // run is allowed to mark episodes while this recovery sits queued.
   const silent = claimed.workflowRun.kind === "staging_recovery";
-  const keepEpisodes = willRetry || claimed.workflowRun.kind === "replace_request";
+  const keepEpisodes = willRetry || claimed.workflowRun.kind === "replace_request" || Boolean(claimed.workflowRun.movieUpgrade);
   await repository.saveWorkflowRunSnapshot({
     accountId: claimed.accountId,
     connectedStorageId: claimed.connectedStorageId,
@@ -436,6 +471,7 @@ export async function runQueuedType2Workflow(input: {
   llmConfig?: { baseURL?: string; modelId?: string };
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  movieQualityPreference?: "blu-ray-iso";
   now?: () => string;
   storageParentDirectoryId?: string;
   /** Separate landing parent for anime (see runQueuedSeriesInitialization). */
@@ -570,6 +606,7 @@ export async function runScheduledType3Monitoring(input: {
   model: LanguageModel;
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  movieQualityPreference?: "blu-ray-iso";
   storageParentDirectoryId: string;
   /** Separate landing parent for anime, so anime patrol verify-or-creates under
    *  its own tree (see runQueuedSeriesInitialization). */
@@ -920,6 +957,7 @@ async function patrolMovie(args: {
     model: LanguageModel;
     preferredLanguage: string | undefined;
     qualityPreference: "high" | "medium" | undefined;
+  movieQualityPreference: "blu-ray-iso" | undefined;
     storageProvider: string | undefined;
     assrtToken: string | undefined;
     jevJudge: JevJudge | undefined;
@@ -965,10 +1003,11 @@ async function patrolMovie(args: {
     connectedStorageId: state.connectedStorageId,
     title: state.title,
     season: state.season,
-    workflowRun: {
-      id: workflowRunId,
-      kind: "movie_init",
-      status: "running",
+      workflowRun: {
+        id: workflowRunId,
+        kind: "movie_init",
+        status: "running",
+        ...(deps.movieQualityPreference === "blu-ray-iso" ? { movieChoiceMode: "blu-ray-iso" as const } : {}),
       trackedSeasonId: state.season.id,
       startedAt,
       finishedAt: null,
@@ -1000,6 +1039,35 @@ async function patrolMovie(args: {
   }
 
   try {
+    if (deps.movieQualityPreference === "blu-ray-iso") {
+      const search = await findMovieChoices({
+        title: state.title,
+        provider: deps.resourceProvider,
+        model: deps.model,
+        workflowRunId,
+        ...(deps.jevJudge ? { jevJudge: deps.jevJudge } : {}),
+        ...(deps.preferredLanguage ? { preferredLanguage: deps.preferredLanguage } : {}),
+        ...(deps.agentMemory ? { memory: { store: input.repository, accountId: state.accountId,
+          ...(state.connectedStorageId ? { drive: state.connectedStorageId } : {}) } } : {}),
+      });
+      if (search.candidates.length === 0) {
+        await input.repository.saveWorkflowRunSnapshot({
+          ...reservation.snapshot,
+          workflowRun: { ...reservation.snapshot.workflowRun, status: "no_coverage", finishedAt: now() },
+          resourceSnapshots: search.resourceSnapshots,
+          keepCurrentEpisodes: true,
+        });
+        return { trackedSeasonId: state.season.id, status: "ran", workflowRunId, workflowStatus: "no_coverage" };
+      }
+      const published = await input.repository.publishMovieChoices({
+        workflowRunId,
+        scope: { accountId: state.accountId, connectedStorageId: state.connectedStorageId },
+        resourceSnapshots: search.resourceSnapshots,
+        candidates: search.candidates,
+      });
+      if (!published) throw new Error("MOVIE_CHOICES_PUBLISH_CONFLICT");
+      return { trackedSeasonId: state.season.id, status: "ran", workflowRunId, workflowStatus: "awaiting_choice" };
+    }
     const result = await runMovieAcquisitionV2AndPersist({
       title: state.title,
       categoryParentId: moviesParent,
@@ -1012,9 +1080,6 @@ async function patrolMovie(args: {
       ...(deps.preferredLanguage === undefined
         ? {}
         : { preferredLanguage: deps.preferredLanguage }),
-      ...(deps.qualityPreference === undefined
-        ? {}
-        : { qualityPreference: deps.qualityPreference }),
       ...(deps.storageProvider === undefined
         ? {}
         : { storageProvider: deps.storageProvider }),
@@ -1124,6 +1189,7 @@ export async function runQueuedMovieAcquisition(input: {
   llmConfig?: { baseURL?: string; modelId?: string };
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  movieQualityPreference?: "blu-ray-iso";
   moviesParentDirectoryId: string;
   now?: () => string;
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
@@ -1153,22 +1219,92 @@ export async function runQueuedMovieAcquisition(input: {
       input,
     );
     resolvedLlmConfig = deps.llmConfig;
+    const chosenId = claimed.workflowRun.movieChoices?.chosenId;
+    let chosenSourceIsIso = false;
+    if (chosenId) {
+      if (!claimed.workflowRun.movieChoices?.candidates.some((candidate) => candidate.id === chosenId)) {
+        throw new Error("CHOSEN_MOVIE_CANDIDATE_INVALID");
+      }
+      const chosen = claimed.resourceSnapshots.flatMap((snapshot) => snapshot.candidates)
+        .find((candidate) => candidate.id === chosenId);
+      if (!chosen) throw new Error("CHOSEN_MOVIE_CANDIDATE_MISSING");
+      const ranked = claimed.workflowRun.movieChoices.candidates.find((item) => item.id === chosenId)!;
+      const preflight = await preflightChosenMovieSource({ storage: deps.storage, candidate: chosen,
+        expectIso: ranked.isoHint || ranked.tier === 1 || ranked.tier === 4 ? true : ranked.tier === null ? null : false });
+      chosenSourceIsIso = preflight.isIso;
+    } else if (claimed.workflowRun.movieChoiceMode === "blu-ray-iso") {
+      const upgrade = claimed.workflowRun.movieUpgrade
+        ? await readMovieUpgradeAssets(deps.storage, deps.moviesParentDirectoryId ?? input.moviesParentDirectoryId, claimed.title,
+          claimed.episodes.flatMap((episode) => episode.verifiedFileIds))
+        : null;
+      const search = await findMovieChoices({
+        title: claimed.title,
+        provider: deps.resourceProvider,
+        model: deps.model,
+        workflowRunId: claimed.workflowRun.id,
+        ...(deps.jevJudge ? { jevJudge: deps.jevJudge } : {}),
+        ...(deps.preferredLanguage ? { preferredLanguage: deps.preferredLanguage } : {}),
+        ...(deps.agentMemory ? { memory: { store: input.repository, accountId: claimed.accountId,
+          ...(claimed.connectedStorageId ? { drive: claimed.connectedStorageId } : {}) } } : {}),
+      });
+      const candidates = upgrade
+        ? search.candidates.filter((candidate) => compareMovieUpgrade(candidate, upgrade.currentAssets) !== "not_better")
+        : search.candidates;
+      const unsupportedIds = new Set(search.resourceSnapshots.flatMap((snapshot) => snapshot.candidates)
+        .filter((candidate) => candidate.type === "magnet" || candidate.type === "manual").map((candidate) => candidate.id));
+      const unsupportedOnly = candidates.length > 0 && candidates.every((candidate) => unsupportedIds.has(candidate.id));
+      if (candidates.length === 0 || unsupportedOnly) {
+        await input.repository.saveWorkflowRunSnapshot({
+          accountId: claimed.accountId,
+          connectedStorageId: claimed.connectedStorageId,
+          title: claimed.title,
+          season: claimed.season,
+          workflowRun: { ...claimed.workflowRun, status: "no_coverage", finishedAt: now(),
+            ...(upgrade ? { movieUpgrade: upgrade } : {}) },
+          episodes: claimed.episodes,
+          resourceSnapshots: search.resourceSnapshots,
+          decisions: [], transferAttempts: [],
+          notifications: upgrade || unsupportedOnly ? [{
+            id: crypto.randomUUID(), workflowRunId: claimed.workflowRun.id, kind: "no_coverage",
+            title: claimed.title.title, body: unsupportedOnly ? "找到的来源均不支持转存前只读核验，未转存；可稍后重新寻找。" : "未找到比当前版本更优的候选，旧版已保留。", createdAt: now(), trigger: "user",
+            report: { titleName: claimed.title.title, seasonLabel: null, status: "no_coverage", lines: [unsupportedOnly ? "找到的来源均不支持转存前只读核验，未转存" : "未找到比当前版本更优的候选，旧版已保留"],
+              newlyObtained: [], realMissing: [], tmdbId: claimed.title.tmdbId, mediaType: "movie" },
+          }] : [],
+          keepCurrentEpisodes: true,
+        });
+        return { status: "ran", workflowRunId: claimed.workflowRun.id, workflowStatus: "no_coverage" };
+      }
+      if (upgrade) {
+        await input.repository.saveWorkflowRunSnapshot({ ...claimed,
+          workflowRun: { ...claimed.workflowRun, movieUpgrade: upgrade }, keepCurrentEpisodes: true });
+      }
+      const published = await input.repository.publishMovieChoices({
+        workflowRunId: claimed.workflowRun.id,
+        scope: { accountId: claimed.accountId, connectedStorageId: claimed.connectedStorageId },
+        resourceSnapshots: search.resourceSnapshots,
+        candidates,
+      });
+      if (!published) throw new Error("MOVIE_CHOICES_PUBLISH_CONFLICT");
+      return { status: "ran", workflowRunId: claimed.workflowRun.id, workflowStatus: "awaiting_choice" };
+    }
+    const guardedStorage = chosenId ? captureMovieStorageAuth(deps.storage) : null;
     const result = await runMovieAcquisitionV2AndPersist({
       title: claimed.title,
       categoryParentId:
         deps.moviesParentDirectoryId ?? input.moviesParentDirectoryId,
-      resourceProvider: deps.resourceProvider,
-      storage: deps.storage,
+      resourceProvider: chosenId ? chosenMovieProvider(claimed.resourceSnapshots, chosenId) : deps.resourceProvider,
+      storage: chosenId && chosenSourceIsIso
+        ? storageForChosenIso(guardedStorage!.storage)
+        : guardedStorage?.storage ?? deps.storage,
       model: deps.model,
       repository: input.repository,
       accountId: claimed.accountId,
       connectedStorageId: claimed.connectedStorageId,
+      ...(chosenId ? { movieChoiceSnapshot: claimed, chosenSourceIsIso } : {}),
+      ...(guardedStorage ? { rejectBdmv: guardedStorage.bdmvDetected } : {}),
       ...(deps.preferredLanguage === undefined
         ? {}
         : { preferredLanguage: deps.preferredLanguage }),
-      ...(deps.qualityPreference === undefined
-        ? {}
-        : { qualityPreference: deps.qualityPreference }),
       ...(deps.storageProvider === undefined
         ? {}
         : { storageProvider: deps.storageProvider }),
@@ -1188,12 +1324,68 @@ export async function runQueuedMovieAcquisition(input: {
       },
       now,
     });
+    if (guardedStorage?.authError()) throw guardedStorage.authError();
+    if (chosenId && claimed.workflowRun.movieUpgrade && result.status === "succeeded") {
+      const upgrade = claimed.workflowRun.movieUpgrade;
+      const landedIds = new Set(result.episodes.flatMap((episode) => episode.verifiedFileIds));
+      let cleanupStatus: "removed" | "retained" | "failed" = "retained";
+      try {
+        const landed = upgrade.directoryId && landedIds.size > 0
+          ? (await deps.storage.listTree({ directoryId: upgrade.directoryId })).filter((file) => landedIds.has(file.providerFileId))
+          : [];
+        const actual = landed.flatMap((file) => {
+          const evidence = result.movieAssetEvidence?.find((asset) => asset.fileId === file.providerFileId);
+          return evidence ? [evidence] : [];
+        });
+        const selected = claimed.workflowRun.movieChoices?.candidates.find((candidate) => candidate.id === chosenId);
+        const better = !result.movieNamingWarnings?.length && selected &&
+          compareMovieUpgrade(selected, upgrade.currentAssets ?? []) === "better" &&
+          actual.length > 0 && actual.length === landed.length && actual.every((asset) => asset.tier !== null &&
+          compareMovieUpgrade({ tier: asset.tier!, dolbyVision: asset.dolbyVision, atmos: asset.atmos }, upgrade.currentAssets ?? []) === "better");
+        if (better && upgrade.directoryId && upgrade.oldFiles?.length) {
+          const oldIds = upgrade.oldFiles.map((file) => file.id).filter((id) => !landedIds.has(id));
+          const deleted = await deps.storage.deleteFiles({ directoryId: upgrade.directoryId, fileIds: oldIds });
+          if (deleted.deleted.length !== oldIds.length) throw new Error("MOVIE_UPGRADE_CLEANUP_PARTIAL");
+          cleanupStatus = "removed";
+        }
+      } catch { cleanupStatus = "failed"; }
+      const line = cleanupStatus === "removed" ? "新版已验证，旧版及匹配字幕已清理" :
+        cleanupStatus === "failed" ? "新版已验证，旧版清理失败，请手动检查" :
+        "新版已验证，旧版保留（实际画质不可比较或未确认更优）";
+      const lines = result.movieNamingWarnings?.length
+        ? [line, "电影文件命名未全部完成，请检查；旧版保留。"] : [line];
+      try {
+        const saved = await input.repository.getWorkflowRunSnapshot(claimed.workflowRun.id,
+          { accountId: claimed.accountId, connectedStorageId: claimed.connectedStorageId });
+        if (saved) await input.repository.saveWorkflowRunSnapshot({ ...saved,
+          workflowRun: { ...saved.workflowRun,
+            movieUpgrade: { ...upgrade, cleanupStatus },
+            auditEvents: [...saved.workflowRun.auditEvents,
+              { type: `movie_upgrade_${cleanupStatus}`, message: line }] },
+          notifications: saved.notifications.map((notification) => ({ ...notification, body: lines.join("\n"),
+            ...(notification.report ? { report: { ...notification.report, lines } } : {}) })),
+          keepCurrentEpisodes: true });
+      } catch {
+        console.error("[media-track] movie upgrade result report could not be saved");
+      }
+    }
     return {
       status: "ran",
       workflowRunId: claimed.workflowRun.id,
       workflowStatus: result.status,
     };
   } catch (error) {
+    const preflightReason = movieSharePreflightFailure(error);
+    if (claimed.workflowRun.movieChoices?.chosenId && preflightReason && !isBrandStorageAuthError(error)) {
+      const waiting = await input.repository.returnMovieChoiceToWaiting({ workflowRunId: claimed.workflowRun.id,
+        scope: { accountId: claimed.accountId, connectedStorageId: claimed.connectedStorageId }, reason: preflightReason });
+      if (waiting) return { status: "ran", workflowRunId: claimed.workflowRun.id, workflowStatus: "awaiting_choice" };
+    }
+    if (claimed.workflowRun.movieChoices?.chosenId && isChosenMovieSourceError(error)) {
+      const waiting = await input.repository.returnMovieChoiceToWaiting({ workflowRunId: claimed.workflowRun.id,
+        scope: { accountId: claimed.accountId, connectedStorageId: claimed.connectedStorageId } });
+      if (waiting) return { status: "ran", workflowRunId: claimed.workflowRun.id, workflowStatus: "awaiting_choice" };
+    }
     const handled = await handleWorkflowRunFailure({
       claimed,
       error,
@@ -1210,6 +1402,14 @@ export async function runQueuedMovieAcquisition(input: {
   }
 }
 
+/** Only a proven source/link problem returns to the pick list. Auth, LLM and
+ * persistence faults continue through the normal retry/freeze path. */
+export function isChosenMovieSourceError(error: unknown): boolean {
+  if (isBrandStorageAuthError(error) || isLlmAuthError(error) || isLlmHttpStatusError(error)) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return /CHOSEN_MOVIE_CANDIDATE|dead.?link|expired.?link|invalid.?share|resource.?unavailable|资源.*(?:失效|不存在)|分享.*(?:失效|取消)|提取码.*(?:错误|失效)/i.test(message);
+}
+
 export async function runQueuedSeriesInitialization(input: {
   repository: WorkflowRepository;
   resourceProvider: ResourceProvider;
@@ -1219,6 +1419,7 @@ export async function runQueuedSeriesInitialization(input: {
   llmConfig?: { baseURL?: string; modelId?: string };
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  movieQualityPreference?: "blu-ray-iso";
   storageParentDirectoryId: string;
   /** Separate landing parent for anime, so the 动漫 shelf is physically its own
    *  tree on 115 and never mixed into the TV shows directory. */

@@ -29,6 +29,7 @@ import { episodeCodeFromFileName } from "./episode-code.js";
 import type { StorageExecutor, UnparsedVideoFile } from "./ports.js";
 import { isTianyiAuthError } from "./tianyi-client.js";
 import type { TianyiBatchEntry, TianyiClient, TianyiItem } from "./tianyi-client.js";
+import { inspectShareTree } from "./movie-share-preflight.js";
 
 const MAX_RECURSIVE_COLLECT_DEPTH = 6;
 const DEFAULT_MIN_VIDEO_SIZE_BYTES = 10 * 1024 * 1024;
@@ -95,6 +96,30 @@ export class TianyiStorageExecutor implements StorageExecutor {
     this.videoExtensions = new Set(
       (options.videoExtensions ?? DEFAULT_VIDEO_EXTENSIONS).map((ext) => ext.toLowerCase()),
     );
+  }
+
+  async inspectCandidateShare(candidate: ResourceCandidate): Promise<{ files: string[]; directories: string[] }> {
+    if (candidate.type !== "tianyi") throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const parsed = parseTianyiShareUrl(stringValue(candidate.providerPayload["url"]));
+    if (!parsed) throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const accessCode = stringValue(candidate.providerPayload["password"]) || parsed.accessCode;
+    const info = await this.client.getShareInfo(parsed.shareCode);
+    return inspectShareTree(async (fileId) => {
+      const rows: TianyiItem[] = [];
+      const seen = new Set<string>();
+      for (let pageNum = 1; pageNum <= 50; pageNum += 1) {
+        const batch = await this.client.listShareDir({ shareId: info.shareId, fileId,
+          shareMode: info.shareMode, accessCode, pageNum, strict: true });
+        if (batch.length === 0) return rows.map((item) => ({ id: idOf(item), name: nameOf(item), directory: isDirectory(item) }));
+        for (const item of batch) {
+          const id = idOf(item);
+          if (!id || seen.has(id)) throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+          seen.add(id);
+        }
+        rows.push(...batch);
+      }
+      throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+    }, info.fileId);
   }
 
   async createDirectory(input: { name: string; parentId: string }): Promise<string> {

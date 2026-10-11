@@ -55,6 +55,7 @@ import {
   getWorkflowRepository,
   PREFERRED_LANGUAGE_SETTING_KEY,
   QUALITY_PREFERENCE_SETTING_KEY,
+  MOVIE_QUALITY_PREFERENCE_SETTING_KEY,
   LLM_BASE_URL_SETTING_KEY,
   LLM_MODEL_ID_SETTING_KEY,
   LLM_API_KEY_SETTING_KEY,
@@ -285,7 +286,17 @@ async function PreferredLanguageSection() {
 async function QualityPreferenceSection() {
   await connection();
   const repository = getAccountScopedSettings(await getCurrentAccountId());
-  const initial = (await repository.getSetting(QUALITY_PREFERENCE_SETTING_KEY)) ?? "any";
+  const [legacyQuality, storedMovieQuality] = await Promise.all([
+    repository.getSetting(QUALITY_PREFERENCE_SETTING_KEY),
+    repository.getSetting(MOVIE_QUALITY_PREFERENCE_SETTING_KEY),
+  ]);
+  const legacyQualityWasMovieMode = legacyQuality?.trim() === "blu-ray-iso";
+  const legacyValue = legacyQuality?.trim();
+  const movieValue = storedMovieQuality?.trim();
+  const initial = legacyValue === "high" || legacyValue === "medium" ? legacyValue : "any";
+  const movieQualityPreference = storedMovieQuality === null
+    ? legacyQualityWasMovieMode ? "blu-ray-iso" : "any"
+    : movieValue === "blu-ray-iso" ? "blu-ray-iso" : "any";
 
   return (
     <section className="panel" style={{ maxWidth: 720, marginTop: 24 }}>
@@ -295,10 +306,10 @@ async function QualityPreferenceSection() {
             <Gauge size={16} aria-hidden style={{ verticalAlign: "-2px", marginRight: 8 }} />
             偏好画质
           </h2>
-          <p className="panel-note">优先获取的画质档位（覆盖优先，找不到不留缺）</p>
+          <p className="panel-note">剧集、动漫与电影分别设置获取偏好</p>
         </div>
       </div>
-      <QualityPreferenceForm initial={initial} />
+      <QualityPreferenceForm initial={initial} movieQualityPreference={movieQualityPreference} legacyQualityWasMovieMode={legacyQualityWasMovieMode} />
     </section>
   );
 }

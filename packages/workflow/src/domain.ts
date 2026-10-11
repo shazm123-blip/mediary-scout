@@ -45,6 +45,8 @@ export function isUserVisibleNotificationKind(kind: string): boolean {
 export type WorkflowStatus =
   | "queued"
   | "running"
+  /** Movie candidates are durable; no worker or cloud-directory write while the user chooses. */
+  | "awaiting_choice"
   | "succeeded"
   | "failed"
   | "partial"
@@ -138,6 +140,22 @@ export interface WorkflowRun {
    *  on worker start. Absent/0 = never orphan-recovered. Capped at
    *  ORPHAN_REQUEUE_MAX so a poison run cannot crash-loop the worker forever. */
   orphanRequeueCount?: number;
+  /** User-approved movie source, stored in the run payload (no schema change). */
+  movieChoices?: {
+    version: 1;
+    candidates: import("./movie-quality-policy.js").RankedMovieCandidate[];
+    chosenId?: string;
+    lastFailure?: { candidateId: string; reason: string };
+  };
+  /** Frozen when movie_init is reserved, so a later setting change cannot bypass the choice gate. */
+  movieChoiceMode?: "blu-ray-iso";
+  /** Manual upgrade retains the exact old assets until a new file is verified. */
+  movieUpgrade?: {
+    directoryId?: string;
+    currentAssets?: Array<{ name: string; sizeBytes: number; tier: import("./movie-quality-policy.js").MovieQualityTier | null; dolbyVision: boolean; atmos: boolean }>;
+    oldFiles?: Array<{ id: string; path: string }>;
+    cleanupStatus?: "removed" | "retained" | "failed";
+  };
 }
 
 export interface AuditEvent {

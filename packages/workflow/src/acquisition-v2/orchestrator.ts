@@ -54,6 +54,7 @@ export interface RunAcquisitionV2Request {
   targetSeasonDirectoryIds?: Record<number, string>;
   /** Movie: the single scoped movie directory this task may write into. */
   targetMovieDirectoryId?: string;
+  userChosenSource?: boolean;
   searchBudget?: number;
   /** 预搜退避重试的等待毫秒数(sandbox 默认 PRESEARCH_RETRY_DELAY_MS)。测试注入 0。 */
   presearchRetryDelayMs?: number;
@@ -242,6 +243,7 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     executor: request.executor,
     registry,
     workflowRunId: request.workflowRunId,
+    ...(request.userChosenSource ? { allowIsoMovie: true } : {}),
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
   });
   const need = request.target.kind === "tv" ? needForTvTarget(request.target) : needForMovie();

@@ -26,6 +26,8 @@ export interface DesktopDownload {
 }
 
 export interface UpdateView {
+  /** A custom build cannot switch directly to an upstream release tag. */
+  forkProtected?: boolean;
   current: { label: string; tag: string | null };
   /** The newest release strictly newer than what is running, or null. Never a downgrade. */
   available: ReleaseEntry | null;

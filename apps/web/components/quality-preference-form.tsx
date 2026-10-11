@@ -2,65 +2,99 @@
 
 import { useState, useTransition } from "react";
 import { Check, LoaderCircle } from "lucide-react";
-import { saveQualityPreferenceAction } from "../app/actions";
+import { saveMovieQualityPreferenceAction, saveQualityPreferenceAction } from "../app/actions";
 import { runAction } from "../lib/run-action";
 
-const QUALITIES = [
+const SERIES_QUALITIES = [
   { key: "any", label: "不限（默认）" },
   { key: "high", label: "高画质（≈4K）" },
   { key: "medium", label: "中画质（≈1080p）" },
 ] as const;
 
-export function QualityPreferenceForm({ initial }: { initial: string }) {
-  const [isPending, startTransition] = useTransition();
-  const [value, setValue] = useState(initial || "any");
-  const [result, setResult] = useState<string | null>(null);
+export function QualityPreferenceForm({
+  initial,
+  movieQualityPreference,
+  legacyQualityWasMovieMode = false,
+}: {
+  initial: string;
+  movieQualityPreference: string;
+  legacyQualityWasMovieMode?: boolean;
+}) {
+  const [seriesPending, startSeriesTransition] = useTransition();
+  const [moviePending, startMovieTransition] = useTransition();
+  const [seriesValue, setSeriesValue] = useState(initial);
+  const [movieValue, setMovieValue] = useState(movieQualityPreference);
+  const [showLegacyWarning, setShowLegacyWarning] = useState(legacyQualityWasMovieMode);
+  const [seriesResult, setSeriesResult] = useState<string | null>(null);
+  const [movieResult, setMovieResult] = useState<string | null>(null);
 
-  const handleSave = () => {
-    startTransition(async () => {
-      // 必须 catch:server action 会 throw(demo 门禁、运行时错误、网络中断),
-      // 不 catch 就是未处理 rejection,界面上什么都不变(见 runAction 注释)。
-      // 业务错误(success:false)仍走下方原逻辑;这里只拦异常。
+  const saveSeries = () => {
+    startSeriesTransition(async () => {
       const r = await runAction(
-        () => saveQualityPreferenceAction(value),
-        (msg) => {
-          setResult(`❌ ${msg}`);
-          setTimeout(() => setResult(null), 3000);
-        },
+        () => saveQualityPreferenceAction(seriesValue),
+        (msg) => setSeriesResult(`❌ ${msg}`),
       );
       if (!r.ok) return;
-      const res = r.value;
-      setResult(res.success ? "✅ 保存成功" : `❌ ${res.message ?? "保存失败"}`);
-      setTimeout(() => setResult(null), 3000);
+      if (r.value.success) setShowLegacyWarning(false);
+      setSeriesResult(r.value.success ? "✅ 保存成功" : `❌ ${r.value.message ?? "保存失败"}`);
+    });
+  };
+
+  const saveMovie = () => {
+    startMovieTransition(async () => {
+      const r = await runAction(
+        () => saveMovieQualityPreferenceAction(movieValue),
+        (msg) => setMovieResult(`❌ ${msg}`),
+      );
+      if (!r.ok) return;
+      setMovieResult(r.value.success ? "✅ 保存成功" : `❌ ${r.value.message ?? "保存失败"}`);
     });
   };
 
   return (
     <div className="push-form">
-      <p className="panel-note" style={{ marginBottom: 12 }}>
-        偏好的画质档位会作为「召回后选片优先级」传给 AI；找不到目标画质时仍优先保证入库完整（覆盖优先）。画质不进搜索关键词。
-      </p>
+      <p className="panel-note" style={{ marginBottom: 12 }}>剧集和动漫的偏好画质会作为选片优先级传给 AI。</p>
+      {showLegacyWarning ? (
+        <p className="panel-note" style={{ marginBottom: 12 }} role="status">
+          旧版电影模式曾覆盖剧集画质偏好，原设置无法恢复。请重新选择剧集和动漫的画质偏好。
+        </p>
+      ) : null}
       <div className="setting-row">
         <select
-          value={value}
-          onChange={(event) => setValue(event.target.value)}
+          value={seriesValue}
+          onChange={(event) => { setSeriesValue(event.target.value); setSeriesResult(null); }}
           className="setting-control"
-          aria-label="偏好画质"
+          aria-label="剧集和动漫偏好画质"
         >
-          {QUALITIES.map((quality) => (
-            <option key={quality.key} value={quality.key}>
-              {quality.label}
-            </option>
-          ))}
+          {SERIES_QUALITIES.map((quality) => <option key={quality.key} value={quality.key}>{quality.label}</option>)}
         </select>
-        <button type="button" className="primary-button" onClick={handleSave} disabled={isPending}>
-          {isPending ? <LoaderCircle size={14} className="spin" aria-hidden /> : <Check size={14} aria-hidden />}
+        <button type="button" className="primary-button" onClick={saveSeries} disabled={seriesPending} aria-label="保存剧集和动漫偏好画质">
+          {seriesPending ? <LoaderCircle size={14} className="spin" aria-hidden /> : <Check size={14} aria-hidden />}
           保存
         </button>
       </div>
-      {result ? (
-        <p className="panel-note" style={{ marginTop: 10 }}>
-          {result}
+      {seriesResult ? <p className="panel-note" role="status" style={{ marginTop: 8 }}>{seriesResult}</p> : null}
+
+      <p className="panel-note" style={{ margin: "20px 0 12px" }}>电影画质偏好单独保存，不影响剧集和动漫。</p>
+      <div className="setting-row">
+        <select
+          value={movieValue}
+          onChange={(event) => { setMovieValue(event.target.value); setMovieResult(null); }}
+          className="setting-control"
+          aria-label="电影偏好画质"
+        >
+          <option value="any">不限（默认）</option>
+          <option value="blu-ray-iso">蓝光 ISO 优先（选源后获取）</option>
+        </select>
+        <button type="button" className="primary-button" onClick={saveMovie} disabled={moviePending} aria-label="保存电影偏好画质">
+          {moviePending ? <LoaderCircle size={14} className="spin" aria-hidden /> : <Check size={14} aria-hidden />}
+          保存
+        </button>
+      </div>
+      {movieResult ? <p className="panel-note" role="status" style={{ marginTop: 8 }}>{movieResult}</p> : null}
+      {movieValue === "blu-ray-iso" ? (
+        <p className="panel-note" style={{ marginTop: 12 }}>
+          AI 搜索后按 1. BD ISO 4K → 2. BD REMUX 4K → 3. 普通 4K → 4. BD ISO 1080P → 5. BD REMUX 1080P → 6. 普通 1080P 排序。同档双杜比优先，其次单杜比；BDMV 排除。画质无法确认的资源单独列出，选定前不会转存。
         </p>
       ) : null}
     </div>

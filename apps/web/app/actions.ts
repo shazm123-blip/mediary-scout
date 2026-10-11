@@ -538,11 +538,40 @@ export async function saveQualityPreferenceAction(
 ): Promise<PushSettingsActionResult> {
   assertNotDemo();
   try {
-    const { getWorkflowRepository, getCurrentAccountId, QUALITY_PREFERENCE_SETTING_KEY } = await import(
+    if (!["any", "high", "medium"].includes(quality.trim())) {
+      return { success: false, message: "无效的画质偏好。" };
+    }
+    const { getWorkflowRepository, getCurrentAccountId, getAccountScopedSettings, QUALITY_PREFERENCE_SETTING_KEY, MOVIE_QUALITY_PREFERENCE_SETTING_KEY } = await import(
       "../lib/workflow-runtime"
     );
     const repository = getWorkflowRepository();
-    await repository.setAccountSetting(await getCurrentAccountId(), QUALITY_PREFERENCE_SETTING_KEY, quality.trim());
+    const accountId = await getCurrentAccountId();
+    const scoped = getAccountScopedSettings(accountId, repository);
+    const moviePreference = await scoped.getSetting(MOVIE_QUALITY_PREFERENCE_SETTING_KEY);
+    const legacyPreference = await scoped.getSetting(QUALITY_PREFERENCE_SETTING_KEY);
+    if (moviePreference === null && legacyPreference?.trim() === "blu-ray-iso") {
+      await repository.setAccountSetting(accountId, MOVIE_QUALITY_PREFERENCE_SETTING_KEY, "blu-ray-iso");
+    }
+    await repository.setAccountSetting(accountId, QUALITY_PREFERENCE_SETTING_KEY, quality.trim());
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function saveMovieQualityPreferenceAction(
+  quality: string,
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    if (!["any", "blu-ray-iso"].includes(quality.trim())) {
+      return { success: false, message: "无效的电影画质偏好。" };
+    }
+    const { getWorkflowRepository, getCurrentAccountId, MOVIE_QUALITY_PREFERENCE_SETTING_KEY } = await import(
+      "../lib/workflow-runtime"
+    );
+    const repository = getWorkflowRepository();
+    await repository.setAccountSetting(await getCurrentAccountId(), MOVIE_QUALITY_PREFERENCE_SETTING_KEY, quality.trim());
     return { success: true };
   } catch (error) {
     return { success: false, message: `保存失败：${String(error)}` };

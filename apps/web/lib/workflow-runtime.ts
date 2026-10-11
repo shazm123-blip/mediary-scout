@@ -847,6 +847,7 @@ export async function queueCandidateTracking(
       repository: getWorkflowRepository(),
       accountId,
       connectedStorageId: workspace.id,
+      ...((await getMovieQualityPreference(getAccountScopedSettings(accountId))) === "blu-ray-iso" ? { movieChoiceMode: "blu-ray-iso" as const } : {}),
     });
     return {
       status: request.status === "queued" ? "queued" : request.status,
@@ -940,7 +941,7 @@ export function buildAccountContextResolver(): ResolveAccountWorkerContext {
     // specific drive it was queued onto.
     const scoped = getAccountScopedSettings(accountId);
     const parents = await getWorkerStorageParents(accountId, connectedStorageId);
-    const { model, llmConfig, preferredLanguage, qualityPreference } = await getAgentModel(scoped);
+    const { model, llmConfig, preferredLanguage, qualityPreference, movieQualityPreference } = await getAgentModel(scoped);
     // The run's drive brand selects its resource sources (quark→PanSou quark-only;
     // 115→PanSou+Prowlarr). null when no drive resolves → default 115 fallback.
     const driveProvider =
@@ -971,6 +972,7 @@ export function buildAccountContextResolver(): ResolveAccountWorkerContext {
       agentMemory,
       ...(preferredLanguage === undefined ? {} : { preferredLanguage }),
       ...(qualityPreference === undefined ? {} : { qualityPreference }),
+      ...(movieQualityPreference === undefined ? {} : { movieQualityPreference }),
       storageParentDirectoryId: parents.tv,
       animeStorageParentDirectoryId: parents.anime,
       moviesParentDirectoryId: parents.movies,
@@ -1035,9 +1037,10 @@ async function runNextQueuedWorkflowNow(claim: QueueClaimOptions | undefined) {
   // The user's language preference is standing context baked into the agent
   // instance (one global preference), so every workflow — movie, series, type2,
   // anime — searches with it. No per-workflow plumbing.
-  const { model, llmConfig, preferredLanguage, qualityPreference } = await getAgentModel(getAccountScopedSettings(accountId));
+  const { model, llmConfig, preferredLanguage, qualityPreference, movieQualityPreference } = await getAgentModel(getAccountScopedSettings(accountId));
   const language = preferredLanguage === undefined ? {} : { preferredLanguage };
   const quality = qualityPreference === undefined ? {} : { qualityPreference };
+  const movieQuality = movieQualityPreference === undefined ? {} : { movieQualityPreference };
   const storage = await getWorkerStorageExecutor(accountId);
   const parents = await getWorkerStorageParents(accountId);
   const resolveAccountContext = buildAccountContextResolver();
@@ -1105,7 +1108,7 @@ async function runNextQueuedWorkflowNow(claim: QueueClaimOptions | undefined) {
     // resolveAccountContext's llmConfig.
     llmConfig,
     ...language,
-    ...quality,
+    ...movieQuality,
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
@@ -1127,6 +1130,7 @@ async function runNextQueuedWorkflowNow(claim: QueueClaimOptions | undefined) {
     llmConfig,
     ...language,
     ...quality,
+    ...movieQuality,
     storageParentDirectoryId: parents.tv,
     animeStorageParentDirectoryId: parents.anime,
     moviesParentDirectoryId: parents.movies,
@@ -1177,6 +1181,7 @@ export async function getPreferredLanguage(
 export const PREFERRED_LANGUAGE_SETTING_KEY = "preferred_language";
 
 export const QUALITY_PREFERENCE_SETTING_KEY = "quality_preference";
+export const MOVIE_QUALITY_PREFERENCE_SETTING_KEY = "movie_quality_preference";
 
 /** The user's acquisition quality preference, or undefined when 不限/unset
  *  (the default). undefined → inject NO quality guidance (coverage-only, current
@@ -1187,6 +1192,17 @@ export async function getQualityPreference(
 ): Promise<"high" | "medium" | undefined> {
   const value = (await repository.getSetting(QUALITY_PREFERENCE_SETTING_KEY))?.trim();
   return value === "high" || value === "medium" ? value : undefined;
+}
+
+/** A separate movie policy; the legacy mixed value is read only until the new
+ *  setting has been saved. An explicit "any" must override that legacy value. */
+export async function getMovieQualityPreference(
+  repository: { getSetting(key: string): Promise<string | null> },
+): Promise<"blu-ray-iso" | undefined> {
+  const movieValue = await repository.getSetting(MOVIE_QUALITY_PREFERENCE_SETTING_KEY);
+  if (movieValue !== null) return movieValue.trim() === "blu-ray-iso" ? "blu-ray-iso" : undefined;
+  return (await repository.getSetting(QUALITY_PREFERENCE_SETTING_KEY))?.trim() === "blu-ray-iso"
+    ? "blu-ray-iso" : undefined;
 }
 
 // AI 模型 (LLM) 三件套 — OpenAI-compatible. Stored in the user's OWN app_settings
@@ -1974,7 +1990,7 @@ async function runScheduledType3Now(options?: { force?: boolean }): Promise<Sche
     await hydratePan115CookieFromDb();
     const sync = tmdbSeasonMetadataSync();
     const accountId = await getCurrentAccountId();
-    const { model, preferredLanguage, qualityPreference } = await getAgentModel(getAccountScopedSettings(accountId));
+    const { model, preferredLanguage, qualityPreference, movieQualityPreference } = await getAgentModel(getAccountScopedSettings(accountId));
     const parents = await getWorkerStorageParents(accountId);
     result = await runScheduledType3Monitoring({
       repository,
@@ -1983,6 +1999,7 @@ async function runScheduledType3Now(options?: { force?: boolean }): Promise<Sche
       model,
       ...(preferredLanguage === undefined ? {} : { preferredLanguage }),
       ...(qualityPreference === undefined ? {} : { qualityPreference }),
+      ...(movieQualityPreference === undefined ? {} : { movieQualityPreference }),
       storageParentDirectoryId: parents.tv,
       animeStorageParentDirectoryId: parents.anime,
       moviesParentDirectoryId: parents.movies,
@@ -2879,12 +2896,14 @@ async function getAgentModel(repository: {
   llmConfig: { baseURL?: string; modelId?: string };
   preferredLanguage: string | undefined;
   qualityPreference: "high" | "medium" | undefined;
+  movieQualityPreference: "blu-ray-iso" | undefined;
 }> {
   assertWorkflowAgentAdapterPolicy(process.env);
   const env = process.env;
   const adapter = env.MEDIA_TRACK_AGENT_ADAPTER === "vercel-ai" ? "vercel-ai" : "fake";
   const preferredLanguage = await getPreferredLanguage(repository);
   const qualityPreference = await getQualityPreference(repository);
+  const movieQualityPreference = await getMovieQualityPreference(repository);
 
   // Resolve the live model config the SAME way the test action does (shared
   // resolver) — DB-first, then .env, then the shipped free preset
@@ -2919,7 +2938,7 @@ async function getAgentModel(repository: {
     ...(baseURL === undefined ? {} : { baseURL }),
     ...(modelId === undefined ? {} : { modelId }),
   };
-  return { model, llmConfig, preferredLanguage, qualityPreference };
+  return { model, llmConfig, preferredLanguage, qualityPreference, movieQualityPreference };
 }
 
 function fakeTransferOutcomes() {

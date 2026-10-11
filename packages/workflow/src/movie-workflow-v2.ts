@@ -25,6 +25,8 @@ import { runAcquisitionV2, type RunAcquisitionV2Request, type RunAcquisitionV2Re
 import type { JevJudge } from "./jev-judge.js";
 import { getQualityGuidance, getSearchRecipe } from "./acquisition-v2/search-profile.js";
 import { ensureMediaLibraryDirectory } from "./media-library-folder.js";
+import { renameLandedMovieFiles } from "./movie-file-naming.js";
+import { classifyExistingMovieAsset, type MovieQualityTier } from "./movie-quality-policy.js";
 
 function defaultNowIso(): string {
   return new Date().toISOString();
@@ -49,6 +51,10 @@ export interface RunMovieAcquisitionV2Request {
   preferredLanguage?: string;
   /** Global quality preference ("high"/"medium"); undefined = 不限 (no guidance). */
   qualityPreference?: "high" | "medium";
+  /** True only after a durable user choice; permits the chosen ISO as a movie asset. */
+  userChosenSource?: boolean;
+  expectIso?: boolean;
+  rejectBdmv?: () => boolean;
   /** The run's drive brand ("pan115" | "quark") — selects brand-specific skill. */
   storageProvider?: string;
   /** assrt token (Settings → 字幕来源). Undefined = 字幕流程不触发。 */
@@ -74,7 +80,12 @@ export interface RunMovieAcquisitionV2Request {
 }
 
 /** The movie result plus the replace outcome of a replace_request run. */
-export type MovieAcquisitionV2Result = MovieWorkflowResult & { replacement?: RunAcquisitionV2Result["replacement"] };
+export type MovieAcquisitionV2Result = MovieWorkflowResult & {
+  replacement?: RunAcquisitionV2Result["replacement"];
+  movieNamingWarnings?: string[];
+  /** Actual file evidence captured before any generated filename is written. */
+  movieAssetEvidence?: Array<{ fileId: string; tier: MovieQualityTier | null; dolbyVision: boolean; atmos: boolean }>;
+};
 
 export async function runMovieAcquisitionV2(
   request: RunMovieAcquisitionV2Request,
@@ -93,6 +104,7 @@ export async function runMovieAcquisitionV2(
     year: request.title.year ?? "—",
     tmdbId: request.title.tmdbId,
   });
+  const beforeFileIds = new Set((await request.storage.listTree({ directoryId: movieDirectoryId })).map((file) => file.providerFileId));
 
   const v2 = await runAcquisitionV2({
     provider: request.resourceProvider,
@@ -109,9 +121,12 @@ export async function runMovieAcquisitionV2(
     },
     stagingDirectoryId: movieDirectoryId,
     targetMovieDirectoryId: movieDirectoryId,
+    ...(request.userChosenSource ? { userChosenSource: true } : {}),
     searchHints: getSearchRecipe("movie"), // movie search is origin-independent
     searchProfile: "movie",
-    ...(getQualityGuidance("movie", request.qualityPreference) === ""
+    ...(request.userChosenSource
+      ? { qualityGuidance: "用户已经选择这个唯一候选。只转存已选资源，允许 BD ISO 作为正片文件；仍排除 BDMV。不可更换资源。检查实际落地的 ISO/MKV/MP4 文件，失败则如实报告。" }
+      : getQualityGuidance("movie", request.qualityPreference) === ""
       ? {}
       : { qualityGuidance: getQualityGuidance("movie", request.qualityPreference) }),
     ...(request.searchBudget === undefined ? {} : { searchBudget: request.searchBudget }),
@@ -137,7 +152,31 @@ export async function runMovieAcquisitionV2(
   // A replace run never un-obtains the film: the old file stays in the directory
   // whether or not a replacement landed (spec §4.5). One that was never obtained
   // is obtained only by what landed now.
-  const obtained = v2.coverage.coverageMet || (request.userRequest !== undefined && request.priorObtained === true);
+  const landedFiles = (await request.storage.listTree({ directoryId: movieDirectoryId }))
+    .filter((file) => !beforeFileIds.has(file.providerFileId));
+  const verifiedAssets = landedFiles.filter((file) =>
+    !/(?:^|\/)BDMV(?:\/|$)/i.test(file.path) &&
+    (request.expectIso ? /\.iso$/i.test(file.path) : /\.(mkv|mp4|avi|ts|m2ts|mov|flv|wmv)$/i.test(file.path)) &&
+    !file.path.includes("/"),
+  );
+  let obtained = (v2.coverage.coverageMet || (request.userRequest !== undefined && request.priorObtained === true)) &&
+    (!request.userChosenSource || verifiedAssets.length > 0) && !request.rejectBdmv?.();
+  const movieAssetEvidence = verifiedAssets.map((file) => {
+    const quality = classifyExistingMovieAsset(file.path, file.sizeBytes);
+    return { fileId: file.providerFileId, tier: quality.tier, dolbyVision: quality.dolbyVision, atmos: quality.atmos };
+  });
+  const naming = obtained && verifiedAssets.length > 0
+    ? await renameLandedMovieFiles({ storage: request.storage, directoryId: movieDirectoryId,
+      title: request.title, eligibleFileIds: verifiedAssets.map((file) => file.providerFileId), beforeFileIds })
+    : { renamed: [], warnings: [] };
+  const finalFileIds = naming.renamed.length > 0 || naming.warnings.length > 0
+    ? new Set((await request.storage.listTree({ directoryId: movieDirectoryId })).map((file) => file.providerFileId))
+    : new Set(landedFiles.map((file) => file.providerFileId));
+  const finalVerifiedAssets = verifiedAssets.filter((file) => finalFileIds.has(file.providerFileId));
+  if (finalVerifiedAssets.length !== verifiedAssets.length) {
+    obtained = false;
+    naming.warnings.push("重命名后的电影文件身份无法核实，请检查；旧版保留。");
+  }
 
   // Real landed volume for the push (best-effort; never fails the run). The
   // movie dir IS the staging+final location, so its video file(s) are the film.
@@ -154,14 +193,26 @@ export async function runMovieAcquisitionV2(
     snapshots: v2.outcome.resourceSnapshots,
     attempts: v2.outcome.transferAttempts,
     decisions: v2.outcome.decisions,
-    auditEvents: v2.auditEvents,
+    auditEvents: [...v2.auditEvents,
+      ...(naming.renamed.length > 0 ? [{ type: "movie_files_renamed", message: `已按片名、年份和版本标记重命名 ${naming.renamed.length} 个文件` }] : []),
+      ...naming.warnings.map((message) => ({ type: "movie_file_rename_incomplete", message }))],
+    verifiedFileIds: finalVerifiedAssets.map((file) => file.providerFileId),
     // 中文字幕软兜底: the agent landed a raw match with no confirmed 中字 → flag it.
     subtitleFallback: obtained && v2.coverage.subtitleFallback,
     ...(landed ? { landed } : {}),
     ...(v2.replacement ? { replacementResults: v2.replacement.results } : {}),
     now,
   });
-  return v2.replacement ? { ...result, replacement: v2.replacement } : result;
+  if (naming.warnings.length > 0) {
+    result.notifications = result.notifications.map((notification) => {
+      if (!notification.report) return notification;
+      const report = { ...notification.report, lines: [...notification.report.lines, "电影文件命名未全部完成，请检查；旧版保留。"] };
+      return { ...notification, report, body: formatReportPushText(report) };
+    });
+    result.notification = result.notifications.find((item) => item.id === result.notification.id) ?? result.notification;
+  }
+  return { ...result, movieAssetEvidence, movieNamingWarnings: naming.warnings,
+    ...(v2.replacement ? { replacement: v2.replacement } : {}) };
 }
 
 function buildResult(input: {
@@ -174,6 +225,7 @@ function buildResult(input: {
   attempts: TransferAttempt[];
   decisions: AgentDecision[];
   auditEvents: AuditEvent[];
+  verifiedFileIds?: string[];
   /** Landed via the 中文字幕 last-resort fallback (no confirmed 中字) → notification flag. */
   subtitleFallback?: boolean;
   landed?: LandedSize;
@@ -191,7 +243,7 @@ function buildResult(input: {
     seasonNumber: 1,
     totalEpisodes: 1,
     latestAiredEpisode: 1,
-  }).map((episode) => ({ ...episode, obtained: input.obtained }));
+  }).map((episode) => ({ ...episode, obtained: input.obtained, verifiedFileIds: input.obtained ? input.verifiedFileIds ?? [] : [] }));
 
   const t = input.request.title;
   const meta = { posterPath: t.posterPath ?? null, tmdbId: t.tmdbId, mediaType: t.type, year: t.year };

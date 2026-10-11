@@ -28,6 +28,7 @@ import { episodeCodeFromFileName } from "./episode-code.js";
 import { isGuangYaAuthError, parseGuangYaShareUrl } from "./guangya-client.js";
 import type { GuangYaResolvedRes, GuangYaTaskStatus } from "./guangya-client.js";
 import type { StorageExecutor, UnparsedVideoFile } from "./ports.js";
+import { inspectShareTree } from "./movie-share-preflight.js";
 
 const MAX_RECURSIVE_COLLECT_DEPTH = 6;
 const DEFAULT_MIN_VIDEO_SIZE_BYTES = 10 * 1024 * 1024;
@@ -80,7 +81,7 @@ export interface GuangYaStorageClient {
    *  GuangYaClient implements all four). A share candidate on a client without them
    *  fails loud rather than silently falling back to offline. */
   getShareAccessToken?(shareId: string, code: string): Promise<string>;
-  listShareFiles?(accessToken: string, parentId: string): Promise<GuangYaStorageItem[]>;
+  listShareFiles?(accessToken: string, parentId: string, options?: { strict?: boolean }): Promise<GuangYaStorageItem[]>;
   restoreShare?(input: { accessToken: string; fileIds: string[]; parentId: string }): Promise<string>;
   getTaskStatus?(taskId: string): Promise<{ status: number }>;
 }
@@ -144,6 +145,16 @@ export class GuangYaStorageExecutor implements StorageExecutor {
     this.taskPollIntervalMs = options.taskPollIntervalMs ?? 3000;
     this.subtitleTaskPollMaxPolls = options.subtitleTaskPollMaxPolls ?? 16;
     this.subtitleTaskPollIntervalMs = options.subtitleTaskPollIntervalMs ?? 3000;
+  }
+
+  async inspectCandidateShare(candidate: ResourceCandidate): Promise<{ files: string[]; directories: string[] }> {
+    if (candidate.type !== "guangya") throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const parsed = parseGuangYaShareUrl(stringValue(candidate.providerPayload["url"]));
+    if (!parsed || !this.client.getShareAccessToken || !this.client.listShareFiles) throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const code = stringValue(candidate.providerPayload["password"]) || parsed.code;
+    const token = await this.client.getShareAccessToken(parsed.shareId, code);
+    return inspectShareTree(async (parentId) => (await this.client.listShareFiles!(token, parentId, { strict: true }))
+      .map((item) => ({ id: item.fileId, name: item.fileName, directory: item.resType === 2 })), "");
   }
 
   async createDirectory(input: { name: string; parentId: string }): Promise<string> {

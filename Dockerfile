@@ -77,6 +77,7 @@ ARG NODE_IMAGE=node:22-slim
 FROM ${DOCKER_MIRROR:+${DOCKER_MIRROR}/library/}${NODE_IMAGE} AS runner
 WORKDIR /app
 ENV NODE_ENV=production
+ENV MEDIA_TRACK_FORK_BUILD=1
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 # Standalone traces from the monorepo root → server entry at apps/web/server.js.

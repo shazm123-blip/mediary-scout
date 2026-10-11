@@ -19,6 +19,7 @@ import type { PackageTreeFile, ResourceCandidate, TransferAttempt, TransferStatu
 import { episodeCodeFromFileName } from "./episode-code.js";
 import { isPan123AuthError } from "./pan123-client.js";
 import type { Pan123Client, Pan123Item, Pan123OfflineTask } from "./pan123-client.js";
+import { inspectShareTree } from "./movie-share-preflight.js";
 import type { StorageExecutor, UnparsedVideoFile } from "./ports.js";
 
 const MAX_RECURSIVE_COLLECT_DEPTH = 6;
@@ -220,6 +221,16 @@ export class Pan123StorageExecutor implements StorageExecutor {
     // Monotonic: the subtitle deadlines (window, link lifetime, landing grace) are
     // durations, and a wall clock that steps (NTP) would stretch or cut them.
     this.now = options.now ?? (() => performance.now());
+  }
+
+  async inspectCandidateShare(candidate: ResourceCandidate): Promise<{ files: string[]; directories: string[] }> {
+    if (candidate.type !== "123") throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const parsed = parsePan123ShareUrl(stringValue(candidate.providerPayload["url"]));
+    if (!parsed) throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const sharePwd = stringValue(candidate.providerPayload["password"]) || parsed.sharePwd;
+    return inspectShareTree(async (parentFileId) =>
+      (await this.client.listShareDir({ shareKey: parsed.shareKey, sharePwd, parentFileId, strict: true }))
+        .map((item) => ({ id: item.id, name: item.name, directory: item.isFolder })), "0");
   }
 
   async createDirectory(input: { name: string; parentId: string }): Promise<string> {

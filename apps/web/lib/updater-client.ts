@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isForkBuild } from "./fork-update-policy";
 
 export type UpdaterPhase =
   | "idle"
@@ -102,7 +103,8 @@ export async function getUpdaterStatus(options: ClientOptions = {}): Promise<Upd
 export async function requestUpdate(
   tag: string,
   options: ClientOptions = {},
-): Promise<{ ok: true } | { ok: false; reason: "no_updater" | "busy" | "needs_recovery" | "serving_unknown" | "bad_tag" | "unreachable" }> {
+): Promise<{ ok: true } | { ok: false; reason: "fork_protected" | "no_updater" | "busy" | "needs_recovery" | "serving_unknown" | "bad_tag" | "unreachable" }> {
+  if (isForkBuild()) return { ok: false, reason: "fork_protected" };
   const token = await readToken(options.stateDir ?? DEFAULT_STATE_DIR);
   if (!token) return { ok: false, reason: "no_updater" };
   try {

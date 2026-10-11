@@ -25,6 +25,8 @@ export interface UnparsedVideoFile {
 }
 
 export interface StorageExecutor {
+  /** Read-only complete share-tree inspection; chosen movies require it before any cloud write. */
+  inspectCandidateShare?(candidate: ResourceCandidate): Promise<{ files: string[]; directories: string[] }>;
   createDirectory(input: { name: string; parentId: string }): Promise<string>;
   listVideoFiles(directoryId: string): Promise<VerifiedFile[]>;
   /** Video files in the directory whose names expose no parseable episode code. */

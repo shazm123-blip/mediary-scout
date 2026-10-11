@@ -4,6 +4,8 @@ export * from "./agent-error.js";
 export * from "./media-classification.js";
 export * from "./media-library-folder.js";
 export * from "./movie-workflow-v2.js";
+export * from "./movie-quality-policy.js";
+export * from "./movie-choice-search.js";
 export * from "./notification-report.js";
 export * from "./season-sync.js";
 export * from "./ports.js";

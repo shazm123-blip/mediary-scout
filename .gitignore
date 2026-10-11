@@ -67,3 +67,6 @@ docs/images/devto-cover.*
 
 # The updater/deploy shared lock file (scripts/deploy.sh + updater/run-update.sh).
 /.update.lock
+
+# Local development verification artifacts (logs, screenshots, source manifests).
+/docs/testing/

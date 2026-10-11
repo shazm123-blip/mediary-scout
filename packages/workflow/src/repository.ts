@@ -253,6 +253,13 @@ export type WorkflowRunReservationResult =
     };
 
 export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
+  /** Publish the completed search only if this run is still running in this scope. */
+  publishMovieChoices(input: { workflowRunId: string; scope: WorkflowScope; resourceSnapshots: ResourceSnapshot[]; candidates: import("./movie-quality-policy.js").RankedMovieCandidate[] }): Promise<boolean>;
+  /** Atomic CAS; a repeated choice of the same candidate is idempotent. */
+  chooseMovieCandidate(input: { workflowRunId: string; candidateId: string; scope: WorkflowScope }): Promise<"chosen" | "already_chosen" | "unavailable">;
+  /** A chosen link failed unexpectedly; allow another explicit choice. */
+  returnMovieChoiceToWaiting(input: { workflowRunId: string; scope: WorkflowScope; reason?: string }): Promise<boolean>;
+  restartMovieChoiceSearch(input: { workflowRunId: string; scope: WorkflowScope }): Promise<boolean>;
   saveWorkflowRunSnapshot(
     input: PersistWorkflowRunSnapshotInput & {
       /** Write the run only. The season's episode bucket stays as stored.
@@ -1190,6 +1197,54 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     return withDerivedEpisodeSummaries(cloneWorkflowValue(stored));
   }
 
+  async publishMovieChoices(input: { workflowRunId: string; scope: WorkflowScope; resourceSnapshots: ResourceSnapshot[]; candidates: import("./movie-quality-policy.js").RankedMovieCandidate[] }): Promise<boolean> {
+    const stored = this.workflowRuns.get(input.workflowRunId);
+    if (!stored || stored.accountId !== input.scope.accountId || stored.connectedStorageId !== input.scope.connectedStorageId || !["movie_init", "replace_request"].includes(stored.workflowRun.kind) || stored.workflowRun.status !== "running") return false;
+    if (input.candidates.some((item) => !input.resourceSnapshots.some((snap) => snap.candidates.some((candidate) => candidate.id === item.id)))) return false;
+    const next = cloneWorkflowValue(stored);
+    next.workflowRun.status = "awaiting_choice";
+    next.workflowRun.movieChoices = { version: 1, candidates: input.candidates };
+    next.resourceSnapshots = input.resourceSnapshots;
+    this.workflowRuns.set(input.workflowRunId, next);
+    return true;
+  }
+
+  async chooseMovieCandidate(input: { workflowRunId: string; candidateId: string; scope: WorkflowScope }): Promise<"chosen" | "already_chosen" | "unavailable"> {
+    const stored = this.workflowRuns.get(input.workflowRunId);
+    if (!stored || stored.accountId !== input.scope.accountId || stored.connectedStorageId !== input.scope.connectedStorageId) return "unavailable";
+    if (stored.workflowRun.status === "queued" && stored.workflowRun.movieChoices?.chosenId === input.candidateId) return "already_chosen";
+    if (stored.workflowRun.status !== "awaiting_choice" || !validMovieChoice(stored, input.candidateId)) return "unavailable";
+    const next = cloneWorkflowValue(stored);
+    next.workflowRun.status = "queued";
+    next.workflowRun.movieChoices = { ...next.workflowRun.movieChoices!, chosenId: input.candidateId };
+    this.workflowRuns.set(input.workflowRunId, next);
+    return "chosen";
+  }
+
+  async returnMovieChoiceToWaiting(input: { workflowRunId: string; scope: WorkflowScope; reason?: string }): Promise<boolean> {
+    const stored = this.workflowRuns.get(input.workflowRunId);
+    if (!stored || stored.accountId !== input.scope.accountId || stored.connectedStorageId !== input.scope.connectedStorageId || stored.workflowRun.status !== "running" || !stored.workflowRun.movieChoices?.chosenId) return false;
+    const next = cloneWorkflowValue(stored);
+    next.workflowRun.status = "awaiting_choice";
+    next.workflowRun.movieChoices = { version: 1, candidates: next.workflowRun.movieChoices!.candidates,
+      lastFailure: { candidateId: next.workflowRun.movieChoices!.chosenId!, reason: input.reason ?? "所选资源链接失效，请改选。" } };
+    next.workflowRun.auditEvents.push({ type: "chosen_movie_source_failed", message: "Selected source failed; waiting for another user choice" });
+    this.workflowRuns.set(input.workflowRunId, next);
+    return true;
+  }
+
+  async restartMovieChoiceSearch(input: { workflowRunId: string; scope: WorkflowScope }): Promise<boolean> {
+    const stored = this.workflowRuns.get(input.workflowRunId);
+    if (!stored || stored.accountId !== input.scope.accountId || stored.connectedStorageId !== input.scope.connectedStorageId ||
+        stored.workflowRun.status !== "awaiting_choice" || !stored.workflowRun.movieChoices) return false;
+    const next = cloneWorkflowValue(stored);
+    next.workflowRun.status = "queued";
+    delete next.workflowRun.movieChoices;
+    next.resourceSnapshots = [];
+    this.workflowRuns.set(input.workflowRunId, next);
+    return true;
+  }
+
   async claimNextQueuedWorkflowRun(input: {
     kind: WorkflowKind;
     now: string;
@@ -1384,7 +1439,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     // Only an init run owns its season's tracking. Anything else (a replace_request
     // on a library that already has files) is just removed — plus, for a replace
     // run, any messages it held go back to pending.
-    if (!tearsDownTrackingOnCancel(stored.workflowRun.kind)) {
+    if (stored.workflowRun.movieUpgrade || !tearsDownTrackingOnCancel(stored.workflowRun.kind)) {
       if (stored.workflowRun.kind === "replace_request") {
         // The user cancelled: nothing of this work stays urgent, or the idle scan would
         // queue it again within seconds. It waits for the patrol (or 现在处理).
@@ -1809,7 +1864,16 @@ export function cloneWorkflowValue<T>(value: T): T {
 }
 
 export function isActiveWorkflowStatus(status: WorkflowStatus): boolean {
-  return status === "queued" || status === "running";
+  return status === "queued" || status === "running" || status === "awaiting_choice";
+}
+
+export function validMovieChoice(
+  snapshot: Pick<PersistWorkflowRunSnapshotInput, "workflowRun" | "resourceSnapshots">,
+  candidateId: string,
+): boolean {
+  return (snapshot.workflowRun.kind === "movie_init" || snapshot.workflowRun.kind === "replace_request") &&
+    snapshot.workflowRun.movieChoices?.candidates.some((item) => item.id === candidateId) === true &&
+    snapshot.resourceSnapshots.some((resource) => resource.candidates.some((candidate) => candidate.id === candidateId));
 }
 
 /** Hides rows the previous janitor wrote. */
@@ -1876,6 +1940,7 @@ export function isStaleActiveWorkflowRun(
   workflowRun: WorkflowRun,
   staleActiveRunStartedBefore: string,
 ): boolean {
+  if (workflowRun.status === "awaiting_choice") return false;
   if (workflowRun.startedAt >= staleActiveRunStartedBefore) {
     return false;
   }

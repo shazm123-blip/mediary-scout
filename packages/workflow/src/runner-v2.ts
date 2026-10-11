@@ -20,7 +20,7 @@ import { makeAgentTraceSink, combineToolEventSinks } from "./acquisition-v2/agen
 import { runMovieAcquisitionV2, type MovieAcquisitionV2Result, type RunMovieAcquisitionV2Request } from "./movie-workflow-v2.js";
 import type { JevJudge } from "./jev-judge.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
-import type { PersistWorkflowRunSnapshotInput, WorkflowRepository } from "./repository.js";
+import type { PersistedWorkflowRunSnapshot, PersistWorkflowRunSnapshotInput, WorkflowRepository } from "./repository.js";
 import { userMessageDrive } from "./user-requests.js";
 import { stampReplaceNotification } from "./notification-report.js";
 
@@ -753,6 +753,11 @@ export async function runMovieAcquisitionV2AndPersist(input: {
   preferredLanguage?: string;
   /** Global quality preference ("high"/"medium"); undefined = 不限 (no guidance). */
   qualityPreference?: "high" | "medium";
+  /** Set on the second, user-approved run; preserves the first turn's candidates. */
+  movieChoiceSnapshot?: PersistedWorkflowRunSnapshot;
+  /** Actual share contents, checked before any storage write. */
+  chosenSourceIsIso?: boolean;
+  rejectBdmv?: () => boolean;
   /** The run's drive brand ("pan115" | "quark") — selects brand-specific skill. */
   storageProvider?: string;
   /** assrt token (Settings → 字幕来源). Undefined = 字幕流程不触发。 */
@@ -774,6 +779,9 @@ export async function runMovieAcquisitionV2AndPersist(input: {
   now?: () => string;
 }): Promise<MovieAcquisitionV2Result & Partial<HeldLockRun>> {
   const now = resolveNow(input);
+  const chosenCandidate = input.movieChoiceSnapshot?.workflowRun.movieChoices?.candidates.find(
+    (item) => item.id === input.movieChoiceSnapshot?.workflowRun.movieChoices?.chosenId,
+  );
   const result = await runMovieAcquisitionV2({
     title: input.title,
     resourceProvider: input.resourceProvider,
@@ -793,16 +801,48 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...(input.maxSteps === undefined ? {} : { maxSteps: input.maxSteps }),
     ...(input.preferredLanguage === undefined ? {} : { preferredLanguage: input.preferredLanguage }),
     ...(input.qualityPreference === undefined ? {} : { qualityPreference: input.qualityPreference }),
+    ...(input.movieChoiceSnapshot ? { userChosenSource: true } : {}),
+    ...((input.chosenSourceIsIso ?? (chosenCandidate?.isoHint || chosenCandidate?.tier === 1 || chosenCandidate?.tier === 4)) ? { expectIso: true } : {}),
+    ...(input.rejectBdmv ? { rejectBdmv: input.rejectBdmv } : {}),
     ...(input.storageProvider === undefined ? {} : { storageProvider: input.storageProvider }),
     ...(input.assrtToken === undefined ? {} : { assrtToken: input.assrtToken }),
     ...(input.jevJudge === undefined ? {} : { jevJudge: input.jevJudge }),
     ...(input.userRequest === undefined ? {} : { userRequest: input.userRequest }),
     ...(input.priorObtained === undefined ? {} : { priorObtained: input.priorObtained }),
-    ...(await protectExistingOption(input)),
+    ...(input.movieChoiceSnapshot?.workflowRun.movieUpgrade
+      ? { protectExisting: { episodes: ["MOVIE"] } as const }
+      : await protectExistingOption(input)),
     ...rejectedLookupOption(input),
     ...linkHistoryOption({ ...input, workflowRunId: input.workflowRun.id, now }),
     ...memoryOption(input),
   });
+
+  if (input.movieChoiceSnapshot && result.status !== "succeeded") {
+    const previous = input.movieChoiceSnapshot;
+    await input.repository.saveWorkflowRunSnapshot({
+      accountId: previous.accountId,
+      connectedStorageId: previous.connectedStorageId,
+      title: previous.title,
+      season: previous.season,
+      workflowRun: {
+        ...previous.workflowRun,
+        status: "awaiting_choice",
+        finishedAt: null,
+        movieChoices: { version: 1, candidates: previous.workflowRun.movieChoices!.candidates,
+          lastFailure: { candidateId: previous.workflowRun.movieChoices!.chosenId!,
+            reason: "所选资源未能落地或验收未通过，请改选或稍后重试。" } },
+        ...(previous.workflowRun.movieUpgrade ? { movieUpgrade: previous.workflowRun.movieUpgrade } : {}),
+        auditEvents: [...previous.workflowRun.auditEvents, ...result.auditEvents],
+      },
+      episodes: previous.episodes,
+      resourceSnapshots: previous.resourceSnapshots,
+      decisions: previous.decisions,
+      transferAttempts: result.transferAttempts,
+      notifications: [],
+      keepCurrentEpisodes: true,
+    });
+    return { ...result, status: "awaiting_choice" };
+  }
 
   const held = await saveRunRecord({ ...input, now }, result.status, stampNotifications(result.notifications, input.notice), (run, notifications) => ({
     ...(input.accountId ? { accountId: input.accountId } : {}),
@@ -816,9 +856,11 @@ export async function runMovieAcquisitionV2AndPersist(input: {
       trackedSeasonId: result.season.id,
       startedAt: input.workflowRun.startedAt,
       auditEvents: result.auditEvents,
+      ...(input.movieChoiceSnapshot?.workflowRun.movieChoices ? { movieChoices: input.movieChoiceSnapshot.workflowRun.movieChoices } : {}),
+      ...(input.movieChoiceSnapshot?.workflowRun.movieUpgrade ? { movieUpgrade: input.movieChoiceSnapshot.workflowRun.movieUpgrade } : {}),
     },
     episodes: result.episodes,
-    resourceSnapshots: result.resourceSnapshots,
+    resourceSnapshots: input.movieChoiceSnapshot?.resourceSnapshots ?? result.resourceSnapshots,
     decisions: result.decisions,
     transferAttempts: result.transferAttempts,
     notifications,

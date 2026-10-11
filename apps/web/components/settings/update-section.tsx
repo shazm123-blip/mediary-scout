@@ -113,7 +113,9 @@ export function UpdateTab({
             <div className="update-version">{view.current.label}</div>
           </div>
           <div className="update-status-side">
-            {view.available ? (
+            {view.forkProtected ? (
+              <span className="service-pill">定制版本</span>
+            ) : view.available ? (
               <span className="service-pill is-on">有新版本 {view.available.tag}</span>
             ) : view.status === "offline" ? (
               <span className="service-pill is-off">暂时查不到新版本</span>
@@ -122,17 +124,20 @@ export function UpdateTab({
             ) : (
               <span className="service-pill">已是最新</span>
             )}
-            {!desktop && !updating && !view.available ? <CheckUpdatesButton /> : null}
+            {!desktop && !view.forkProtected && !updating && !view.available ? <CheckUpdatesButton /> : null}
           </div>
         </div>
+        {view.forkProtected ? (
+          <p className="update-muted">当前为定制版本。官方更新需先合并并验证，再部署，保留你的获取规则。</p>
+        ) : null}
         {desktop ? <DesktopUpdateHint view={view} /> : null}
-        {!desktop && view.updater && (updating || (view.available && !view.updater.needsManualRecovery && !view.updater.servingUnknown)) ? (
+        {!desktop && !view.forkProtected && view.updater && (updating || (view.available && !view.updater.needsManualRecovery && !view.updater.servingUnknown)) ? (
           <UpdateNowButton tag={updating ? null : (view.available?.tag ?? null)} initial={view.updater} />
         ) : null}
-        {!desktop && !updating && view.available && !view.updater && view.updaterInstalled ? (
+        {!desktop && !view.forkProtected && !updating && view.available && !view.updater && view.updaterInstalled ? (
           <p className="update-muted">更新助手暂时没有回应，稍后刷新再试。</p>
         ) : null}
-        {!desktop && !updating && view.available && !view.updater && !view.updaterInstalled ? (
+        {!desktop && !view.forkProtected && !updating && view.available && !view.updater && !view.updaterInstalled ? (
           <div className="update-migrate">
             <p className="update-muted">一键更新需要先完成一次手动升级。在部署目录运行：</p>
             <pre className="update-cmd">{MIGRATE_COMMAND}</pre>
@@ -154,7 +159,7 @@ export function UpdateTab({
           </p>
         ) : null}
       </section>
-      {!desktop && view.updaterInstalled ? (
+      {!desktop && !view.forkProtected && view.updaterInstalled ? (
         <section className="panel update-auto">
           <AutoUpdateSwitch initial={autoUpdate} />
           <p className="update-muted">

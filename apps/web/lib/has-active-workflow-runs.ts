@@ -44,6 +44,7 @@ function countsBeforeHold(
   now: number,
 ): boolean {
   if (run.workflowRun.status === "running") return true;
+  if (run.workflowRun.status !== "queued") return false;
   const next = run.workflowRun.nextAttemptAt;
   return next === undefined || Date.parse(next) <= now;
 }

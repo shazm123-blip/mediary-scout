@@ -163,6 +163,7 @@ export class QuarkCookieClient {
     pdirFid?: string;
     page?: number;
     size?: number;
+    strict?: boolean;
   }): Promise<QuarkShareItem[]> {
     const response = await this.getJson("/1/clouddrive/share/sharepage/detail", [
       ["pwd_id", input.pwd_id],
@@ -177,6 +178,12 @@ export class QuarkCookieClient {
       ["_sort", "file_type:asc,updated_at:desc"],
     ]);
     const data = unwrap(response, "QUARK_SHARE_DETAIL_FAILED");
+    if (input.strict) {
+      const list = recordValue(data, "list");
+      if (!Array.isArray(list) || list.some((item) => !item || typeof item !== "object" ||
+          !stringValue(recordValue(item, "fid")) || !stringValue(recordValue(item, "file_name")) ||
+          typeof recordValue(item, "dir") !== "boolean")) throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+    }
     return listFrom(data) as QuarkShareItem[];
   }
 

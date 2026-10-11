@@ -14,6 +14,7 @@ import type { PackageTreeFile, ResourceCandidate, TransferAttempt, TransferStatu
 import { episodeCodeFromFileName } from "./episode-code.js";
 import type { StorageExecutor, UnparsedVideoFile } from "./ports.js";
 import { isQuarkAuthError, type QuarkCookieClient, type QuarkItem } from "./quark-cookie-client.js";
+import { inspectShareTree } from "./movie-share-preflight.js";
 
 const MAX_RECURSIVE_COLLECT_DEPTH = 6;
 const DEFAULT_MAX_WRITE_SCOPE_DEPTH = 8;
@@ -74,6 +75,29 @@ export class QuarkStorageExecutor implements StorageExecutor {
       (options.videoExtensions ?? DEFAULT_VIDEO_EXTENSIONS).map((ext) => ext.toLowerCase()),
     );
     this.maxWriteScopeDepth = options.maxWriteScopeDepth ?? DEFAULT_MAX_WRITE_SCOPE_DEPTH;
+  }
+
+  async inspectCandidateShare(candidate: ResourceCandidate): Promise<{ files: string[]; directories: string[] }> {
+    if (candidate.type !== "quark") throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const parsed = parseQuarkShareUrl(stringValue(candidate.providerPayload["url"]));
+    if (!parsed) throw new Error("MOVIE_SHARE_PREFLIGHT_UNSUPPORTED");
+    const passcode = stringValue(candidate.providerPayload["password"]) || parsed.passcode;
+    const stoken = await this.client.getShareToken({ pwd_id: parsed.pwdId, passcode });
+    return inspectShareTree(async (parentId) => {
+      const rows: QuarkItem[] = [];
+      const seen = new Set<string>();
+      for (let page = 1; page <= 50; page += 1) {
+        const batch = await this.client.listShareDetail({ pwd_id: parsed.pwdId, stoken, pdirFid: parentId, page, size: 100, strict: true });
+        if (batch.length === 0) return rows.map((item) => ({ id: idOf(item), name: nameOf(item), directory: isDirectory(item) }));
+        for (const item of batch) {
+          const id = idOf(item);
+          if (!id || seen.has(id)) throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+          seen.add(id);
+        }
+        rows.push(...batch);
+      }
+      throw new Error("MOVIE_SHARE_PREFLIGHT_INCOMPLETE");
+    }, "0");
   }
 
   async createDirectory(input: { name: string; parentId: string }): Promise<string> {

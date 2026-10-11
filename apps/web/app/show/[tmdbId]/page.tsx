@@ -9,6 +9,8 @@ import { AppSidebar } from "../../../components/app-sidebar";
 import { GitHubNameplate } from "../../../components/github-nameplate";
 import { BackLink } from "../../../components/back-link";
 import { MovieSynopsis } from "../../../components/movie-synopsis";
+import { MovieChoicePanel } from "../../../components/movie-choice-panel";
+import { MovieUpgradeButton } from "../../../components/movie-upgrade-button";
 import { RequestTrackButton } from "../../../components/request-track-button";
 import { SeasonDetails } from "../../../components/season-details";
 import { SwapBadgeLive, SwapEpisodeCell, SwapKeepProvider } from "../../../components/swap-keep";
@@ -30,6 +32,7 @@ import {
 import { seasonBadgeState } from "../../../lib/title-aggregate";
 import { nextPatrolLabel, readTitleMessages } from "../../../lib/user-message-server";
 import { showsMessageCard } from "../../../lib/user-message-state";
+import { getMovieChoicesView } from "../../../lib/movie-choice-server";
 import {
   beijingDateTime,
   getActiveWorkspaceScope,
@@ -370,6 +373,9 @@ function MovieHub({
                     storageId={storageId}
                   />
                 ) : null}
+                {view.obtained ? (
+                  <MovieUpgradeButton tmdbId={view.tmdbId} storageId={storageId} acquiring={view.acquiring} />
+                ) : null}
                 {view.state === "acquiring" ? (
                   <Link className="primary-button" href={activityHref}>
                     查看活动
@@ -397,6 +403,9 @@ function MovieHub({
             </div>
           ) : null}
         </div>
+        <Suspense fallback={null}>
+          <MovieChoiceSection tmdbId={view.tmdbId} storageId={storageId} />
+        </Suspense>
         {view.state !== "untracked" ? (
           <TitleMessageSection tmdbId={view.tmdbId} mediaType="movie" storageId={storageId} hasFile={view.obtained} episodes={[]} />
         ) : null}
@@ -405,6 +414,15 @@ function MovieHub({
     </SwapKeepProvider>
     </AcquisitionLockProvider>
   );
+}
+
+async function MovieChoiceSection({ tmdbId, storageId }: { tmdbId: number; storageId: string | undefined }) {
+  const choices = await getMovieChoicesView(
+    getWorkflowRepository(),
+    await getActiveWorkspaceScope(storageId),
+    tmdbId,
+  );
+  return choices ? <MovieChoicePanel view={choices} storageId={storageId} /> : null;
 }
 
 function formatMovieDate(releaseDate: string): string {

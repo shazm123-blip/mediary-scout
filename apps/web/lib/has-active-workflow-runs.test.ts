@@ -69,6 +69,13 @@ describe("hasActiveWorkflowRuns", () => {
     expect(await hasActiveWorkflowRuns(repo)).toBe(false);
   });
 
+  it("does not keep an update busy while a movie waits for a user choice", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    await saveRun(repo, { id: "run-choice", accountId: DEFAULT_ACCOUNT_ID, status: "awaiting_choice", kind: "movie_init" });
+    expect(await hasActiveWorkflowRuns(repo)).toBe(false);
+    expect(await hasActiveWorkflowRuns(repo, { holdStartedAt: 1_000, now: 1_000 + HOLD_GRACE_MS })).toBe(false);
+  });
+
   it("is not busy when the only run has finished", async () => {
     const repo = new InMemoryWorkflowRepository();
     await saveRun(repo, { id: "run-done", accountId: DEFAULT_ACCOUNT_ID, status: "succeeded", kind: "type3_monitor" });
